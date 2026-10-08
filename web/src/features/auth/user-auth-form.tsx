@@ -122,9 +122,35 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   const navigate = useNavigate()
   const { t } = useTranslation()
   const { search } = useLocation();
-  const redirect = toSearchParams(search).get('redirect') || '/';
+  const searchParams = toSearchParams(search);
+  const redirect = searchParams.get('redirect') || '/';
+  const localOnly = searchParams.get('local') === '1';
+  const ssoError = searchParams.get('sso_error');
 
-  const { isPro, ssoEnabled, ldapEnabled } = useEdition()
+  const { isPro, ssoEnabled, ldapEnabled, oidcEnabled, oidcAutoRedirect } = useEdition()
+  // Fork OIDC (community SSO): same /api/auth/oidc/login endpoint as upstream
+  // Pro, plus redirect_to so the user lands where they started.
+  const oidcLoginUrl = resolveApiUrl(
+    '/api/auth/oidc/login' +
+      (redirect !== '/' ? `?redirect_to=${encodeURIComponent(redirect)}` : ''),
+  )
+
+  // The fork callback redirects back with ?sso_error=<message>.
+  useEffect(() => {
+    if (ssoError) {
+      toast({
+        variant: 'destructive',
+        title: t('auth.loginFailed'),
+        description: ssoError,
+      })
+    }
+  }, [ssoError, t])
+
+  useEffect(() => {
+    if (oidcEnabled && oidcAutoRedirect && !localOnly && !ssoError) {
+      window.location.href = oidcLoginUrl
+    }
+  }, [oidcEnabled, oidcAutoRedirect, localOnly, ssoError, oidcLoginUrl])
 
   // Ask whether the configured provider is actually reachable. A down IdP
   // used to be visible only in the server log: the page offered the button
@@ -133,7 +159,7 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   const { data: ssoStatus } = useQuery({
     queryKey: ['sso-status'],
     queryFn: get_sso_status,
-    enabled: ssoEnabled,
+    enabled: ssoEnabled && !oidcEnabled,
     staleTime: 30_000,
     retry: 0,
   })
@@ -366,7 +392,7 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
                 {t('auth.login')}
               </Button>
 
-              {isPro && (
+              {(isPro || oidcEnabled) && (
                 <>
                   <Button
                     variant='outline'
@@ -388,7 +414,7 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
                           title: t('auth.ssoUnavailable'),
                         })
                       } else {
-                        window.location.href = resolveApiUrl('/api/auth/oidc/login')
+                        window.location.href = oidcLoginUrl
                       }
                     }}
                   >

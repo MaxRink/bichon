@@ -53,6 +53,60 @@ pub mod view;
 
 pub type UserModel = BichonUserV2;
 
+fn derive_username_base(email: &str, display_name: Option<&str>) -> String {
+    if let Some(name) = display_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let sanitized: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if !sanitized.is_empty() {
+            return sanitized;
+        }
+    }
+    email
+        .split('@')
+        .next()
+        .unwrap_or("user")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn allocate_unique_username(base: &str) -> BichonResult<String> {
+    let base = if base.is_empty() { "user" } else { base };
+    let base_owned = base.to_string();
+    let candidate_taken = |candidate: &str| -> BichonResult<bool> {
+        let c = candidate.to_string();
+        let existing = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| u.username == c)?;
+        Ok(existing.into_iter().next().is_some())
+    };
+    if !candidate_taken(&base_owned)? {
+        return Ok(base_owned);
+    }
+    for i in 2..1000 {
+        let candidate = format!("{}{}", base_owned, i);
+        if !candidate_taken(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(raise_error!(
+        "Failed to allocate a unique username for auto-provisioned OIDC user".into(),
+        ErrorCode::InternalError
+    ))
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LoginResult {
     pub success: bool,
@@ -69,13 +123,6 @@ pub struct LoginResult {
 }
 
 pub const DEFAULT_ADMIN_USER_ID: u64 = 100000000000000;
-
-/// Username of the default administrator created on first startup.
-pub const DEFAULT_ADMIN_USERNAME: &str = "admin";
-
-/// The password the default administrator is created with. The WebUI shows a
-/// notifications-bell reminder for as long as this password still works.
-pub const DEFAULT_ADMIN_PASSWORD: &str = "admin@bichon";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BichonUserV2 {
@@ -336,9 +383,9 @@ impl BichonUserV2 {
             // 2. Insert the BichonUser with the updated schema
             let user = UserModel {
                 id: DEFAULT_ADMIN_USER_ID,
-                username: DEFAULT_ADMIN_USERNAME.into(),
+                username: "admin".into(),
                 email: "placeholder@example.com".into(),
-                password: Some(hash_login_password(DEFAULT_ADMIN_PASSWORD)?),
+                password: Some(hash_login_password("admin@bichon")?),
 
                 // Use global_roles as defined in our new schema
                 global_roles: vec![DEFAULT_ADMIN_ROLE_ID],
@@ -526,19 +573,81 @@ impl BichonUserV2 {
         find_impl::<UserModel>(DB_MANAGER.db(), &user_id.to_string())
     }
 
-    /// Whether the default administrator account still authenticates with the
-    /// well-known initial password. Read-only: verifies the stored hash
-    /// directly instead of going through `authenticate_user`, so probing never
-    /// touches login bookkeeping (lockout counters, audit events, token
-    /// issuance). Drives the WebUI notifications-bell reminder.
-    pub fn default_admin_password_active() -> bool {
-        match Self::find(DEFAULT_ADMIN_USER_ID) {
-            Ok(Some(user)) => match user.password.as_deref() {
-                Some(stored) => stored_password_matches(stored, DEFAULT_ADMIN_PASSWORD),
-                None => false,
-            },
-            _ => false,
+    /// Resolve or auto-provision a Bichon user for an OIDC login.
+    ///
+    /// Resolution order:
+    ///   1. Match on `(sso_provider, sso_id)` — same subject that logged in before.
+    ///   2. Match on `email` — bind the existing user to this SSO identity.
+    ///   3. Auto-provision a new user with the configured default global role.
+    ///
+    /// Returns the resolved/created user. The caller is expected to issue a
+    /// WebUI access token for that user.
+    pub fn find_or_provision_sso_user(
+        provider: &str,
+        subject: &str,
+        email: &str,
+        display_name: Option<&str>,
+        default_role_id: u64,
+    ) -> BichonResult<UserModel> {
+        let subject_owned = subject.to_string();
+        let provider_owned = provider.to_string();
+
+        let matches_by_sso = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
+            u.sso_id.as_deref() == Some(&subject_owned)
+                && u.sso_provider.as_deref() == Some(&provider_owned)
+        })?;
+        if let Some(user) = matches_by_sso.into_iter().next() {
+            return Ok(user);
         }
+
+        let email_owned = email.to_string();
+        let matches_by_email =
+            filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| u.email == email_owned)?;
+        if let Some(mut user) = matches_by_email.into_iter().next() {
+            let now = utc_now!();
+            user.sso_id = Some(subject.to_string());
+            user.sso_provider = Some(provider.to_string());
+            user.updated_at = now;
+            let user_clone = user.clone();
+            update_impl(DB_MANAGER.db(), &user.id.to_string(), move |_current: UserModel| {
+                Ok(user_clone.clone())
+            })?;
+            return Ok(user);
+        }
+
+        let now = utc_now!();
+        let base = derive_username_base(email, display_name);
+        let username = allocate_unique_username(&base)?;
+        let new_user = UserModel {
+            id: id!(96),
+            username,
+            email: email.to_string(),
+            password: None,
+            account_access_map: BTreeMap::new(),
+            description: Some(format!("Auto-provisioned via OIDC ({})", provider)),
+            global_roles: vec![default_role_id],
+            avatar: None,
+            created_at: now,
+            updated_at: now,
+            acl: None,
+            theme: None,
+            language: None,
+            sso_id: Some(subject.to_string()),
+            sso_provider: Some(provider.to_string()),
+            totp_secret: None,
+            totp_enabled: false,
+            totp_recovery_codes: Vec::new(),
+            // SSO-provisioned role assignments are permanent (no expiries).
+            global_role_expiries: BTreeMap::new(),
+            account_role_expiries: BTreeMap::new(),
+        };
+
+        let user_clone = new_user.clone();
+        with_transaction(DB_MANAGER.db(), move |txn| {
+            txn.insert("users", new_user.key(), &new_user)
+                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))
+        })?;
+        Ok(user_clone)
     }
 
     // ── TOTP two-factor authentication ─────────────────────────────
@@ -929,25 +1038,6 @@ fn hash_login_password(password: &str) -> BichonResult<String> {
         })
 }
 
-/// Verify `candidate` against a stored password hash without any of the
-/// login bookkeeping. Handles both current argon2id hashes and the legacy
-/// encrypted-format hashes, mirroring the check in `authenticate_user`.
-fn stored_password_matches(stored: &str, candidate: &str) -> bool {
-    if stored.starts_with("$argon2id$") {
-        match PasswordHash::new(stored) {
-            Ok(parsed) => Argon2::default()
-                .verify_password(candidate.as_bytes(), &parsed)
-                .is_ok(),
-            Err(_) => false,
-        }
-    } else {
-        match decrypt!(stored) {
-            Ok(decrypted) => bool::from(candidate.as_bytes().ct_eq(decrypted.as_bytes())),
-            Err(_) => false,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,20 +1065,6 @@ mod tests {
             86_400_000,
             "expiry must be milliseconds to compare against utc_now!()"
         );
-    }
-
-    /// The bell reminder hinges on this check: a fresh default-admin hash
-    /// must match the well-known initial password, and nothing else.
-    #[test]
-    fn stored_password_matches_recognises_the_initial_password_only() {
-        let hash = hash_login_password(DEFAULT_ADMIN_PASSWORD).unwrap();
-        assert!(stored_password_matches(&hash, DEFAULT_ADMIN_PASSWORD));
-        assert!(!stored_password_matches(&hash, "admin@bichon-typo"));
-    }
-
-    #[test]
-    fn a_mangled_hash_never_matches() {
-        assert!(!stored_password_matches("not-a-valid-hash", DEFAULT_ADMIN_PASSWORD));
     }
 
     #[test]
