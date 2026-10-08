@@ -19,6 +19,7 @@ pub mod message;
 pub mod metrics;
 pub mod migrate;
 pub mod oauth2;
+pub mod oidc;
 pub mod retention;
 pub mod saved_search;
 pub mod settings;
