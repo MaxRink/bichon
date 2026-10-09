@@ -15,6 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g pnpm@10.18.3
+      - run: pnpm install --frozen-lockfile && pnpm run build
+        working-directory: web
       - run: cargo build --release -p bichon-server -p bichon-cli -p bichon-admin
       - run: |
           mkdir -p docker/amd64
