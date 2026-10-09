@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: mkdir -p "$RUNNER_TEMP/bichon-root"
       - run: cargo test -p bichon-core envelope::extractor::test::placeholder_hashes_finds_unique_hashes --lib
-      - run: cargo test -p bichon-core envelope::extractor::tecovery_guards_reject_wrong_hash_and_message_id --lib
+      - run: cargo test -p bichon-core envelope::extractor::test::recovery_guards_reject_wrong_hash_and_message_id --lib
         env:
           BICHON_ROOT_DIR: ${{ runner.temp }}/bichon-root
       - run: cargo check -p bichon-server
