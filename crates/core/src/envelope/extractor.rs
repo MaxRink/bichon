@@ -836,7 +836,6 @@ async fn recover_message_blob(envelope: &Envelope) -> BichonResult<Bytes> {
     Ok(Bytes::from(raw_body))
 }
 
-
 /// Fetches the archived message from IMAP and returns it only if its content
 /// hash equals the archived `content_hash`. Tries the stored UID first, then
 /// the UIDs returned by `UID SEARCH HEADER Message-ID` (UID changed or the
@@ -846,19 +845,24 @@ async fn fetch_archived_body(
     encoded_mailbox: &str,
     envelope: &Envelope,
 ) -> BichonResult<Vec<u8>> {
-    let mut last_err =
-        match ImapExecutor::fetch_single_message_body(session, encoded_mailbox, envelope.uid).await {
-            Ok(body) if compute_content_hash(&body) == envelope.content_hash => return Ok(body),
-            Ok(body) => raise_error!(
-                format!(
-                    "Fetched message does not match archived content: expected content_hash={} got={}",
-                    envelope.content_hash,
-                    compute_content_hash(&body)
-                ),
-                ErrorCode::ImapUnexpectedResult
+    let mut last_err = match ImapExecutor::fetch_single_message_body(
+        session,
+        encoded_mailbox,
+        envelope.uid,
+    )
+    .await
+    {
+        Ok(body) if compute_content_hash(&body) == envelope.content_hash => return Ok(body),
+        Ok(body) => raise_error!(
+            format!(
+                "Fetched message does not match archived content: expected content_hash={} got={}",
+                envelope.content_hash,
+                compute_content_hash(&body)
             ),
-            Err(e) => e,
-        };
+            ErrorCode::ImapUnexpectedResult
+        ),
+        Err(e) => e,
+    };
 
     let message_id = envelope.message_id.trim();
     if message_id.is_empty() || message_id.contains(['"', '\\', '\r', '\n']) {
@@ -1010,7 +1014,8 @@ mod test {
 
     #[test]
     fn placeholder_hashes_finds_unique_hashes() {
-        let eml = b"a<<BICHON_DETACH_HASH:abc>>b<<BICHON_DETACH_HASH:def>>c<<BICHON_DETACH_HASH:abc>>";
+        let eml =
+            b"a<<BICHON_DETACH_HASH:abc>>b<<BICHON_DETACH_HASH:def>>c<<BICHON_DETACH_HASH:abc>>";
         assert_eq!(super::placeholder_hashes(eml), vec!["abc", "def"]);
         assert!(super::placeholder_hashes(b"no placeholders").is_empty());
         assert!(super::placeholder_hashes(b"<<BICHON_DETACH_HASH:unterminated").is_empty());
@@ -1064,31 +1069,54 @@ mod test {
             "--fixture--\r\n",
         )
         .as_bytes();
-        let message = super::MessageParser::new().parse(raw).expect("fixture parses");
+        let message = super::MessageParser::new()
+            .parse(raw)
+            .expect("fixture parses");
         let email_hash = super::compute_content_hash(raw);
         let infos = super::detach_and_store_attachments(raw, &message, &email_hash, 0, 0).await;
         assert_eq!(infos.len(), 1);
         super::BLOB_MANAGER.drain().await;
         let original_email = super::BLOB_MANAGER
-            .get_email(&email_hash).expect("email lookup").expect("email blob");
+            .get_email(&email_hash)
+            .expect("email lookup")
+            .expect("email blob");
         let attachment_hash = infos[0].content_hash.clone();
         let original_attachment = super::BLOB_MANAGER
-            .get_attachment(&attachment_hash).expect("attachment lookup").expect("attachment blob");
+            .get_attachment(&attachment_hash)
+            .expect("attachment lookup")
+            .expect("attachment blob");
 
-        super::BLOB_MANAGER.queue(super::DetachedEmail {
-            email: (email_hash.clone(), Bytes::from_static(b"tampered email")),
-            attachments: Some(vec![(attachment_hash.clone(), Bytes::from_static(b"tampered attachment"))]),
-        }).await;
+        super::BLOB_MANAGER
+            .queue(super::DetachedEmail {
+                email: (email_hash.clone(), Bytes::from_static(b"tampered email")),
+                attachments: Some(vec![(
+                    attachment_hash.clone(),
+                    Bytes::from_static(b"tampered attachment"),
+                )]),
+            })
+            .await;
         super::BLOB_MANAGER.drain().await;
-        assert_eq!(super::BLOB_MANAGER.get_email(&email_hash).unwrap(), Some(original_email.clone()));
-        assert_eq!(super::BLOB_MANAGER.get_attachment(&attachment_hash).unwrap(), Some(original_attachment));
+        assert_eq!(
+            super::BLOB_MANAGER.get_email(&email_hash).unwrap(),
+            Some(original_email.clone())
+        );
+        assert_eq!(
+            super::BLOB_MANAGER
+                .get_attachment(&attachment_hash)
+                .unwrap(),
+            Some(original_attachment)
+        );
 
-        let message = super::MessageParser::new().parse(raw).expect("fixture reparses");
+        let message = super::MessageParser::new()
+            .parse(raw)
+            .expect("fixture reparses");
         super::detach_and_store_attachments(raw, &message, &email_hash, 0, 0).await;
         super::BLOB_MANAGER.drain().await;
-        assert_eq!(super::BLOB_MANAGER.get_email(&email_hash).unwrap(), Some(original_email));
+        assert_eq!(
+            super::BLOB_MANAGER.get_email(&email_hash).unwrap(),
+            Some(original_email)
+        );
     }
-
 
     #[test]
     fn test_various_html_with_overflow_enabled() {
