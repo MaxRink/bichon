@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
       - run: rustfmt --edition 2021 --check crates/core/src/envelope/extractor.rs crates/server/src/rest/api/message.rs
 
   focused-tests:
@@ -25,6 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: >-
-          cargo test -p bichon-core envelope::extractor::test --lib --
-          --bichon-root-dir "$RUNNER_TEMP/bichon-root"
+      - run: mkdir -p "$RUNNER_TEMP/bichon-root"
+      - run: cargo test -p bichon-core envelope::extractor::test --lib
+        env:
+          BICHON_ROOT_DIR: ${{ runner.temp }}/bichon-root
