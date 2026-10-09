@@ -1,7 +1,9 @@
 name: Build repair image
 
 "on":
-  workflow_dispatch: {}
+  push:
+    branches:
+      - codex/blob-repair-20261009
 
 permissions:
   contents: read
