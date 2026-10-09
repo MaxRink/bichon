@@ -1,6 +1,6 @@
 name: Build repair image
 
-on:
+"on":
   workflow_dispatch: {}
 
 permissions:
