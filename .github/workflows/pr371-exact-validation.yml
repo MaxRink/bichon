@@ -13,7 +13,7 @@ jobs:
   exact-source-validation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout v4
+      - uses: actions/checkout@v4
       - run: git diff --check
       - uses: dtolnay/rust-toolchain@stable
       - run: mkdir -p "$RUNNER_TEMP/bichon-root"
