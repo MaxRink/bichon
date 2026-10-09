@@ -36,7 +36,7 @@ jobs:
       - uses: docker/build-push-action@v6
         id: build
         with:
-          context: .
+          context: docker
           file: docker/Dockerfile
           build-args: |
             CRATE_VERSION=2.1.1
