@@ -16,6 +16,12 @@ jobs:
       - uses: actions/checkout@v4
       - run: git diff --check
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g pnpm@10.18.3
+      - run: pnpm install --frozen-lockfile && pnpm run build
+        working-directory: web
       - run: mkdir -p "$RUNNER_TEMP/bichon-root"
       - run: cargo test -p bichon-core envelope::extractor::test::placeholder_hashes_finds_unique_hashes --lib
       - run: cargo test -p bichon-core envelope::extractor::test::recovery_guards_reject_wrong_hash_and_message_id --lib
