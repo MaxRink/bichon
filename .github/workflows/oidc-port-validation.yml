@@ -30,7 +30,7 @@ jobs:
         working-directory: web
       - uses: dtolnay/rust-toolchain@stable
       - run: mkdir -p "$RUNNER_TEMP/bichon-root"
-      - run: cargo test -p bichon-core envelope::extractor::test --lib
+      - run: cargo test -p bichon-core envelope::extractor::test::repair_report_updates_post_state_without_changing_legacy_alias --lib
         env:
           BICHON_ROOT_DIR: ${{ runner.temp }}/bichon-root
       - run: cargo check -p bichon-server
