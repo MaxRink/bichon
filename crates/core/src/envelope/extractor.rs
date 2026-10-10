@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::{
     account::migration::AccountModel,
     archive::imap::mailbox::MailBox,
-    backup::gate::{BACKUP_ACQUIRE_TIMEOUT, WRITE_GATE, WriteGate},
+    backup::gate::{WriteGate, BACKUP_ACQUIRE_TIMEOUT, WRITE_GATE},
     common::AddrVec,
     envelope::{meta::parse_bichon_metadata, utils::normalize_subject},
     error::{code::ErrorCode, BichonResult},
@@ -852,7 +852,6 @@ async fn persist_recovered_blob_if_allowed(
     true
 }
 
-
 /// Fetches the archived message from IMAP and returns it only if its content
 /// hash equals the archived `content_hash`. Tries the stored UID first, then
 /// the UIDs returned by `UID SEARCH HEADER Message-ID` (UID changed or the
@@ -1043,6 +1042,10 @@ pub async fn repair_envelope_blobs(
         return Ok(report);
     }
     if let Err(e) = recover_message_blob(&envelope).await {
+        // A failed recovery has not changed storage, so expose the observed
+        // pre-repair state instead of returning an empty post-repair list.
+        report.email_missing_after = report.email_missing_before;
+        report.missing_after = report.missing_before.clone();
         report.status = "failed".into();
         report.error = Some(e.to_string());
         return Ok(report);
