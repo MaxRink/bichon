@@ -861,24 +861,20 @@ async fn fetch_archived_body(
     encoded_mailbox: &str,
     envelope: &Envelope,
 ) -> BichonResult<Vec<u8>> {
-    let mut last_err = match ImapExecutor::fetch_single_message_body(
-        session,
-        encoded_mailbox,
-        envelope.uid,
-    )
-    .await
-    {
-        Ok(body) if compute_content_hash(&body) == envelope.content_hash => return Ok(body),
-        Ok(body) => raise_error!(
-            format!(
+    let mut last_err =
+        match ImapExecutor::fetch_single_message_body(session, encoded_mailbox, envelope.uid).await
+        {
+            Ok(body) if compute_content_hash(&body) == envelope.content_hash => return Ok(body),
+            Ok(body) => raise_error!(
+                format!(
                 "Fetched message does not match archived content: expected content_hash={} got={}",
                 envelope.content_hash,
                 compute_content_hash(&body)
             ),
-            ErrorCode::ImapUnexpectedResult
-        ),
-        Err(e) => e,
-    };
+                ErrorCode::ImapUnexpectedResult
+            ),
+            Err(e) => e,
+        };
 
     let message_id = envelope.message_id.trim();
     if message_id.is_empty() || message_id.contains(['"', '\\', '\r', '\n']) {
@@ -1104,29 +1100,35 @@ mod test {
         let gate = super::WriteGate::new();
         gate.pause();
         let raw = b"From: sender@example.test\r\n\r\nbody";
-        let message = super::MessageParser::new().parse(raw).expect("fixture parses");
+        let message = super::MessageParser::new()
+            .parse(raw)
+            .expect("fixture parses");
 
-        assert!(!super::persist_recovered_blob_if_allowed(
-            raw,
-            &message,
-            "paused-recovery-test",
-            0,
-            0,
-            &gate,
-        )
-        .await);
+        assert!(
+            !super::persist_recovered_blob_if_allowed(
+                raw,
+                &message,
+                "paused-recovery-test",
+                0,
+                0,
+                &gate,
+            )
+            .await
+        );
         assert_eq!(gate.in_flight(), 0);
 
         gate.resume();
-        assert!(super::persist_recovered_blob_if_allowed(
-            raw,
-            &message,
-            "admitted-recovery-test",
-            0,
-            0,
-            &gate,
-        )
-        .await);
+        assert!(
+            super::persist_recovered_blob_if_allowed(
+                raw,
+                &message,
+                "admitted-recovery-test",
+                0,
+                0,
+                &gate,
+            )
+            .await
+        );
         assert_eq!(gate.in_flight(), 0);
         super::BLOB_MANAGER.drain().await;
     }
