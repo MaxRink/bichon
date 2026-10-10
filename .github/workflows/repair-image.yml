@@ -4,6 +4,7 @@ name: Build repair image
   push:
     branches:
       - codex/blob-repair-20261009
+      - review/port-repair-fix
 
 permissions:
   contents: read
@@ -12,6 +13,8 @@ permissions:
 jobs:
   image:
     runs-on: ubuntu-latest
+    env:
+      IMAGE_TAG: pr1-${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,8 +40,8 @@ jobs:
             --file docker/Dockerfile \
             --build-arg CRATE_VERSION=2.1.1 \
             --build-arg TARGETARCH=amd64 \
-            --tag ghcr.io/maxrink/bichon:codex-blob-repair-20261009 \
+            --tag ghcr.io/maxrink/bichon:${IMAGE_TAG} \
             docker
-          docker push ghcr.io/maxrink/bichon:codex-blob-repair-20261009
-          digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/maxrink/bichon:codex-blob-repair-20261009)
+          docker push ghcr.io/maxrink/bichon:${IMAGE_TAG}
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/maxrink/bichon:${IMAGE_TAG})
           echo "Image digest: ${digest#*@}" >> "$GITHUB_STEP_SUMMARY"
