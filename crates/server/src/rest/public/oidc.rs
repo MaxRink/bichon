@@ -114,23 +114,26 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
     let claims = result.claims;
 
     // Never use an unverified (or absent) email claim to link a new OIDC
-    // identity to an existing password account.  Doing so would make the
-    // account-linking fallback vulnerable to an IdP that permits a user to
-    // change their email address without proving ownership of it.
-    if verified_email(&claims).is_none() {
-        warn!(subject = %claims.sub, "OIDC login rejected because email_verified was not true");
-        return Ok(redirect_login_error(
-            "OIDC provider did not verify the email claim; ask an administrator to pre-link this account",
-        ));
-    }
-
+    // identity to an existing password account. A pre-linked identity is
+    // still allowed to log in when an IdP omits email_verified: its binding is
+    // already keyed by the verified issuer/subject pair.
     let email = match verified_email(&claims) {
-        Some(e) => e,
-        _ => {
-            return Ok(redirect_login_error(
-                "OIDC provider did not return an email claim; cannot log in",
-            ));
-        }
+        Some(email) => email.to_string(),
+        None => match UserModel::find_sso_user(OIDC_PROVIDER_ID, &claims.sub) {
+            Ok(Some(user)) => user.email,
+            Ok(None) => {
+                warn!(subject = %claims.sub, "OIDC login rejected because email_verified was not true and subject was not pre-linked");
+                return Ok(redirect_login_error(
+                    "OIDC provider did not verify the email claim; ask an administrator to pre-link this account",
+                ));
+            }
+            Err(e) => {
+                error!("Failed to resolve pre-linked OIDC user: {}", e);
+                return Ok(redirect_login_error(
+                    "Failed to resolve Bichon user for OIDC subject. See server logs.",
+                ));
+            }
+        },
     };
 
     let display_name = claims
@@ -142,7 +145,7 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
     let user = match UserModel::find_or_provision_sso_user(
         OIDC_PROVIDER_ID,
         &claims.sub,
-        email,
+        &email,
         display_name,
         SETTINGS.bichon_oidc_default_role_id,
     ) {
