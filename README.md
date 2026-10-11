@@ -99,6 +99,10 @@
 - **OpenAPI 3.0**: Interactive API documentation at `/api-docs` (Swagger UI, ReDoc, Scalar). All endpoints documented with request/response schemas.
 - **Multi-User RBAC**: 5 built-in roles (Admin, Manager, Member, AccountManager, AccountViewer) plus custom roles with 22 granular permissions.
 - **Account-Level Isolation**: Grant users access to specific accounts with scoped roles. Permissions enforced at the API layer.
+- **OIDC SSO (MaxRink fork)**: Authorization-code flow with PKCE, nonce and
+  JWKS ID-token verification. Auto-provisioning defaults to the built-in Member
+  role; an existing local account is linked only when the IdP asserts
+  `email_verified=true` and it is not already bound to another SSO identity.
 - **CLI & WebUI Import Tools**: Import from EML directories, MBOX files (including Gmail variants), Thunderbird profiles, and Outlook PST files via CLI. Import EML files directly from the WebUI.
 - **CLI Export**: Download account data as MBOX via `bichon-cli`.
 - **Bulk Restore**: Restore emails in bulk back to their original IMAP accounts.
@@ -393,6 +397,22 @@ Interactive API documentation is available at:
 | `/api-docs/spec.yaml` | Raw OpenAPI 3.0 YAML |
 
 All `/api/v1/*` endpoints require `Authorization: Bearer <token>`.
+
+### OIDC SSO security boundary
+
+The MaxRink fork exposes OIDC at `/api/auth/oidc/login` and
+`/api/auth/oidc/callback`. Configure the issuer, client credentials, and exact
+HTTPS redirect URI with the `BICHON_OIDC_*` environment variables. The issuer
+discovery document and ID-token issuer, audience, nonce, lifetime, signature,
+and (when applicable) `azp` are verified. The callback uses a short-lived,
+single-use server-side handoff so the WebUI token is not placed in a URL.
+
+OIDC users are provisioned with `BICHON_OIDC_DEFAULT_ROLE_ID`, which defaults
+to the least-privileged Member role. Email matching is deliberately strict:
+the provider must send `email_verified=true`, and Bichon refuses to replace a
+different subject or provider already bound to the local account. Pre-link
+accounts explicitly when an IdP does not provide verified email claims; those
+already-bound subjects can still sign in without a fresh email claim.
 
 ## Import & Export
 
@@ -697,7 +717,7 @@ No. Bichon is an **archiver**, not an email client. The optional SMTP server **r
 - [ ] Account-to-account email merge / migration
 - [ ] MCP Server for LLM-powered email search and analysis
 - [ ] S3-compatible storage backend
-- [ ] Enterprise SSO (OIDC / SAML)
+- [x] OIDC SSO (MaxRink fork; SAML is not implemented)
 
 ## Contributing
 

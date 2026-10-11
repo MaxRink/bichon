@@ -35,7 +35,10 @@ use crate::{
     utc_now,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::{LazyLock, Mutex},
+};
 use subtle::ConstantTimeEq;
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -52,6 +55,12 @@ pub mod role;
 pub mod view;
 
 pub type UserModel = BichonUserV2;
+
+// SSO binding is a read-then-write operation. Bichon runs as one server
+// process, so serialize callbacks to prevent two first logins from both
+// linking the same email or replacing each other's subject between the
+// lookup and update.
+static SSO_BINDING_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn derive_username_base(email: &str, display_name: Option<&str>) -> String {
     if let Some(name) = display_name.map(str::trim).filter(|s| !s.is_empty()) {
@@ -572,6 +581,21 @@ impl BichonUserV2 {
         find_impl::<UserModel>(DB_MANAGER.db(), &user_id.to_string())
     }
 
+    /// Find an already-linked SSO identity without requiring an email claim.
+    /// This lets a pre-linked user sign in even when the provider omits
+    /// `email_verified`, while still forbidding email-based account linking
+    /// without that assertion in the OIDC handler.
+    pub fn find_sso_user(provider: &str, subject: &str) -> BichonResult<Option<UserModel>> {
+        let provider_owned = provider.to_string();
+        let subject_owned = subject.to_string();
+        Ok(filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
+            u.sso_id.as_deref() == Some(&subject_owned)
+                && u.sso_provider.as_deref() == Some(&provider_owned)
+        })?
+        .into_iter()
+        .next())
+    }
+
     /// Resolve or auto-provision a Bichon user for an OIDC login.
     ///
     /// Resolution order:
@@ -588,6 +612,12 @@ impl BichonUserV2 {
         display_name: Option<&str>,
         default_role_id: u64,
     ) -> BichonResult<UserModel> {
+        let _binding_guard = SSO_BINDING_LOCK.lock().map_err(|_| {
+            raise_error!(
+                "OIDC identity binding lock is poisoned".into(),
+                ErrorCode::InternalError
+            )
+        })?;
         let subject_owned = subject.to_string();
         let provider_owned = provider.to_string();
 
@@ -603,6 +633,22 @@ impl BichonUserV2 {
         let matches_by_email =
             filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| u.email == email_owned)?;
         if let Some(mut user) = matches_by_email.into_iter().next() {
+            // An email match is only a safe migration path for a local user
+            // that has not already been bound to another SSO identity.  Do
+            // not silently replace a different subject/provider: the OIDC
+            // handler requires email_verified=true, but a verified address
+            // alone must never let one IdP identity take over another.
+            if user.sso_id.as_deref().is_some_and(|id| id != subject)
+                || user
+                    .sso_provider
+                    .as_deref()
+                    .is_some_and(|bound_provider| bound_provider != provider)
+            {
+                return Err(raise_error!(
+                    "OIDC email is already bound to a different SSO identity".into(),
+                    ErrorCode::PermissionDenied
+                ));
+            }
             let now = utc_now!();
             user.sso_id = Some(subject.to_string());
             user.sso_provider = Some(provider.to_string());
