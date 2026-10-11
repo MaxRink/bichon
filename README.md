@@ -411,7 +411,8 @@ OIDC users are provisioned with `BICHON_OIDC_DEFAULT_ROLE_ID`, which defaults
 to the least-privileged Member role. Email matching is deliberately strict:
 the provider must send `email_verified=true`, and Bichon refuses to replace a
 different subject or provider already bound to the local account. Pre-link
-accounts explicitly when an IdP does not provide verified email claims.
+accounts explicitly when an IdP does not provide verified email claims; those
+already-bound subjects can still sign in without a fresh email claim.
 
 ## Import & Export
 
