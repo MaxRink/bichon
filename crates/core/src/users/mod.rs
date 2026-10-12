@@ -133,6 +133,12 @@ pub struct LoginResult {
 
 pub const DEFAULT_ADMIN_USER_ID: u64 = 100000000000000;
 
+/// Username of the default administrator created on first startup.
+pub const DEFAULT_ADMIN_USERNAME: &str = "admin";
+
+/// Initial administrator password used only for the startup reminder.
+pub const DEFAULT_ADMIN_PASSWORD: &str = "admin@bichon";
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BichonUserV2 {
     pub id: u64,
@@ -392,9 +398,9 @@ impl BichonUserV2 {
             // 2. Insert the BichonUser with the updated schema
             let user = UserModel {
                 id: DEFAULT_ADMIN_USER_ID,
-                username: "admin".into(),
+                username: DEFAULT_ADMIN_USERNAME.into(),
                 email: "placeholder@example.com".into(),
-                password: Some(hash_login_password("admin@bichon")?),
+                password: Some(hash_login_password(DEFAULT_ADMIN_PASSWORD)?),
 
                 // Use global_roles as defined in our new schema
                 global_roles: vec![DEFAULT_ADMIN_ROLE_ID],
@@ -579,6 +585,17 @@ impl BichonUserV2 {
 
     pub fn find(user_id: u64) -> BichonResult<Option<UserModel>> {
         find_impl::<UserModel>(DB_MANAGER.db(), &user_id.to_string())
+    }
+
+    /// Read-only check used by the admin security reminder.
+    pub fn default_admin_password_active() -> bool {
+        match Self::find(DEFAULT_ADMIN_USER_ID) {
+            Ok(Some(user)) => match user.password.as_deref() {
+                Some(stored) => stored_password_matches(stored, DEFAULT_ADMIN_PASSWORD),
+                None => false,
+            },
+            _ => false,
+        }
     }
 
     /// Find an already-linked SSO identity without requiring an email claim.
@@ -1080,6 +1097,22 @@ fn hash_login_password(password: &str) -> BichonResult<String> {
                 ErrorCode::InternalError
             )
         })
+}
+
+fn stored_password_matches(stored: &str, candidate: &str) -> bool {
+    if stored.starts_with("$argon2id$") {
+        match PasswordHash::new(stored) {
+            Ok(parsed) => Argon2::default()
+                .verify_password(candidate.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        }
+    } else {
+        match decrypt!(stored) {
+            Ok(decrypted) => bool::from(candidate.as_bytes().ct_eq(decrypted.as_bytes())),
+            Err(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
