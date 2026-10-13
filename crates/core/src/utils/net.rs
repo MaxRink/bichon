@@ -94,10 +94,10 @@ pub(crate) async fn establish_tcp_connection_with_timeout(
     // task blocks waiting for a slow IMAP server between commands; a hung
     // server therefore surfaces as a network error (and retry) instead of a
     // silently stuck download. 0 disables the read timeout (server decides).
-    let read_timeout = SETTINGS
-        .bichon_imap_timeout_seconds
-        .checked_sub(1)
-        .map(|seconds| Duration::from_secs(seconds.max(1)));
+    let read_timeout = match SETTINGS.bichon_imap_timeout_seconds {
+        0 => None,
+        seconds => Some(Duration::from_secs(seconds)),
+    };
     timeout_stream.set_write_timeout(Some(Duration::from_secs(15)));
     timeout_stream.set_read_timeout(read_timeout);
 

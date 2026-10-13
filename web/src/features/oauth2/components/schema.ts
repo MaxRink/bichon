@@ -50,7 +50,7 @@ export const getOAuth2Schema = (t: (key: string) => string) =>
     scopes: z.array(scopeEntry(t)).optional(),
     extra_params: z.array(paramEntry(t)).optional(),
     enabled: z.boolean(),
-    use_proxy: z.number().optional(),
+    use_proxy: z.number().nullable().optional(),
   })
 
 export type OAuth2FormValues = z.infer<ReturnType<typeof getOAuth2Schema>>

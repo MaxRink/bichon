@@ -148,21 +148,21 @@ impl AttachmentApi {
         }
 
         let total_updates: u64 = req.updates.values().map(|ids| ids.len() as u64).sum();
+        let updated_accounts: Vec<(u64, u64)> = req
+            .updates
+            .iter()
+            .map(|(account_id, ids)| (*account_id, ids.len() as u64))
+            .collect();
+        ATTACHMENT_MANAGER.update_attachment_tags(req).await?;
         if total_updates > 0 {
-            for account_id in req.updates.keys() {
+            for (account_id, count) in updated_accounts {
                 emit(Event::AttachmentTagged {
                     user: context.user.username.clone(),
-                    account_id: *account_id,
-                    count: req
-                        .updates
-                        .get(account_id)
-                        .map(|ids| ids.len() as u64)
-                        .unwrap_or(0),
+                    account_id,
+                    count,
                 });
             }
         }
-
-        ATTACHMENT_MANAGER.update_attachment_tags(req).await?;
         Ok(())
     }
 
