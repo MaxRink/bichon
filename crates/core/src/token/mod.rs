@@ -20,7 +20,8 @@ use std::collections::HashMap;
 
 use crate::database::manager::DB_MANAGER;
 use crate::database::{
-    MemDbModel, delete_impl, filter_impl, find_impl, insert_impl, list_all_impl, update_impl, with_transaction
+    MemDbModel, delete_impl, filter_impl, find_impl, insert_impl, list_all_impl, update_impl,
+    with_transaction_exempt
 };
 use crate::error::code::ErrorCode;
 use crate::raise_error;
@@ -41,6 +42,8 @@ pub mod view;
 pub enum TokenType {
     WebUI,
     Api,
+    /// Short-lived, one-time challenge issued for the MFA login step.
+    MfaChallenge,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -66,6 +69,12 @@ pub struct AccessTokenModel {
 }
 
 impl MemDbModel for AccessTokenModel {
+    /// Tokens are ephemeral credentials that only ever touch memdb: they may
+    /// be written during a backup capture window (see
+    /// [`MemDbModel::BACKUP_GATE_EXEMPT`]) so login and logout keep working
+    /// while a backup runs.
+    const BACKUP_GATE_EXEMPT: bool = true;
+
     fn collection() -> &'static str {
         "tokens"
     }
@@ -114,7 +123,9 @@ impl AccessTokenModel {
 
         match old_token {
             Some(old) => {
-                with_transaction(DB_MANAGER.db(), move |txn| {
+                // Tokens are gate-exempt (memdb-only writes); the exempt
+                // transaction keeps login working during a backup window.
+                with_transaction_exempt(DB_MANAGER.db(), move |txn| {
                     let txn = txn.delete(AccessTokenModel::collection(), old.token.clone());
                     txn.insert(AccessTokenModel::collection(), new_token.key(), &new_token)
                         .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))
@@ -126,6 +137,37 @@ impl AccessTokenModel {
         }
 
         Ok(new_token_str)
+    }
+
+    /// Issue a short-lived, one-time challenge token for the MFA login step.
+    /// Expires after 5 minutes and is consumed by the verify endpoint.
+    pub fn new_mfa_challenge(user_id: u64) -> BichonResult<String> {
+        let now = utc_now!();
+        let expire_at = now + 5 * 60 * 1000;
+
+        // Garbage-collect this user's expired challenges to avoid unbounded growth.
+        let stale = filter_impl::<AccessTokenModel, _>(DB_MANAGER.db(), move |t| {
+            t.user_id == user_id && t.token_type == TokenType::MfaChallenge
+        })?;
+        for stale_token in stale {
+            if stale_token.expire_at.map_or(false, |e| e < now) {
+                let _ = delete_impl::<AccessTokenModel>(DB_MANAGER.db(), &stale_token.token);
+            }
+        }
+
+        let token = AccessTokenModel {
+            token: generate_token!(128),
+            created_at: now,
+            updated_at: now,
+            last_access_at: 0,
+            name: None,
+            user_id,
+            token_type: TokenType::MfaChallenge,
+            expire_at: Some(expire_at),
+        };
+        let token_str = token.token.clone();
+        insert_impl(DB_MANAGER.db(), token)?;
+        Ok(token_str)
     }
 
     pub fn get_user_webui_token(user_id: u64) -> BichonResult<Option<AccessTokenModel>> {
@@ -154,6 +196,14 @@ impl AccessTokenModel {
                     ErrorCode::PermissionDenied
                 )
             })?;
+
+        if matches!(token_model.token_type, TokenType::MfaChallenge) {
+            return Err(raise_error!(
+                "Permission denied: MFA challenge tokens cannot be used as access tokens."
+                    .into(),
+                ErrorCode::PermissionDenied
+            ));
+        }
 
         if matches!(token_model.token_type, TokenType::WebUI) {
             // Use last_access_at if set, otherwise fall back to created_at

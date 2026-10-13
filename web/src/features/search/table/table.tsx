@@ -59,7 +59,7 @@ interface DataTableProps {
   columns: ColumnDef<EmailEnvelope>[]
   data: EmailEnvelope[]
   onRowClick: (e: ReactMouseEvent<HTMLTableRowElement, MouseEvent>, row: Row<EmailEnvelope>) => void
-  setSortBy: (sortBy: "DATE" | "SIZE") => void
+  setSortBy: (sortBy: "DATE" | "SIZE" | "RELEVANCE") => void
   setSortOrder: (value: "desc" | "asc") => void
   children?: (table: Table<EmailEnvelope>) => React.ReactNode
 }
@@ -71,7 +71,11 @@ export function SearchTable({ columns, data, onRowClick, setSortBy, setSortOrder
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([])
 
   useEffect(() => {
+    // With no column sorted we leave the URL sort params unset, so the
+    // backend default applies (RELEVANCE when the query has a text term,
+    // DATE otherwise).
     const [value] = sorting
+    if (!value) return
     setSortBy(value.id.toUpperCase() as "DATE" | "SIZE")
     setSortOrder(value.desc ? "desc" : "asc")
   }, [sorting])
@@ -99,16 +103,16 @@ export function SearchTable({ columns, data, onRowClick, setSortBy, setSortOrder
     <div className="flex flex-1 flex-col gap-0.5">
       {children && (<>{children(table)}</>)}
       <ScrollArea className='h-[calc(100vh-16rem)] rounded-md border' orientation='both'>
-        <ShadcnTable>
+        <ShadcnTable className='text-xs'>
           <TableHeader>
             {table.getHeaderGroups().map((headerGroup) => (
-              <TableRow key={headerGroup.id} className='group/row'>
+              <TableRow key={headerGroup.id} className='group/row h-7'>
                 {headerGroup.headers.map((header) => {
                   return (
                     <TableHead
                       key={header.id}
                       colSpan={header.colSpan}
-                      className={header.column.columnDef.meta?.className ?? ''}
+                      className={cn('h-7 py-1', header.column.columnDef.meta?.className ?? '')}
                     >
                       {header.isPlaceholder
                         ? null
@@ -128,13 +132,13 @@ export function SearchTable({ columns, data, onRowClick, setSortBy, setSortOrder
                 <TableRow
                   key={row.id}
                   data-state={row.getIsSelected() && 'selected'}
-                  className={cn("group/row cursor-pointer transition-colors hover:bg-accent/50")}
+                  className="group/row cursor-pointer transition-colors hover:bg-accent/50 h-7"
                   onClick={(e) => onRowClick(e, row)}
                 >
                   {row.getVisibleCells().map((cell) => (
                     <TableCell
                       key={cell.id}
-                      className={cell.column.columnDef.meta?.className ?? ''}
+                      className={cn('py-1 px-2', cell.column.columnDef.meta?.className ?? '')}
                       style={{
                         width: cell.column.columnDef.size,
                         minWidth: cell.column.columnDef.minSize,

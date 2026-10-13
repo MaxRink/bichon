@@ -38,7 +38,7 @@ import { AttachmentIcon } from "./attachment-icon"
 interface MailListProps {
   items: AttachmentModel[]
   isLoading: boolean
-  setSortBy: (sortBy: "DATE" | "SIZE") => void
+  setSortBy: (sortBy: "DATE" | "SIZE" | "RELEVANCE") => void
   setSortOrder: (value: "desc" | "asc") => void
 }
 
@@ -51,7 +51,7 @@ export function AttachmentListTable({
   const { t, i18n } = useTranslation()
 
   const locale = dateFnsLocaleMap[i18n.language.toLowerCase()] ?? enUS
-  const { selected, setSelected, setOpen, setCurrentAttachment } = useAttachmentContext()
+  const { selected, setSelected, setOpen, setCurrentAttachment, dateDisplay } = useAttachmentContext()
 
   const columns: ColumnDef<AttachmentModel>[] = [
     {
@@ -90,7 +90,7 @@ export function AttachmentListTable({
         const accountPrefix = account_email.split('@')[0];
 
         return (
-          <div className="flex flex-col py-1.5 min-w-0 group">
+          <div className="flex flex-col py-0.5 min-w-0 group">
             <div
               className="cursor-pointer hover:text-primary transition-colors flex items-center gap-1.5"
               onClick={(e) => {
@@ -136,7 +136,7 @@ export function AttachmentListTable({
       header: t('attachment.subject'),
       cell: ({ row }) => {
         return (
-          <div className="group relative flex items-center w-full min-w-0 h-full px-2 overflow-hidden">
+          <div className="group relative flex items-center w-full min-w-0 h-full px-2 py-0.5 overflow-hidden">
             <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-primary opacity-0 group-hover:opacity-100 transition-opacity" />
 
             <div className="text-xs flex flex-wrap gap-x-1 min-w-0 flex-1">
@@ -173,14 +173,14 @@ export function AttachmentListTable({
           : "UNK";
 
         return (
-          <div className="flex flex-col min-w-0 py-1">
+          <div className="flex flex-col min-w-0 py-0.5">
             <div className="flex items-center gap-2.5">
               <AttachmentIcon
                 contentType={content_type ?? ""}
                 className="h-4 w-4 mt-0.5"
               />
 
-              {is_message && <div className="group relative flex items-center w-full min-w-0 h-full px-2 overflow-hidden">
+              {is_message && <div className="group relative flex items-center w-full min-w-0 h-full px-2 py-0.5 overflow-hidden">
                 <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-primary opacity-0 group-hover:opacity-100 transition-opacity" />
 
                 <div className="text-xs flex flex-wrap gap-x-1 min-w-0 flex-1">
@@ -231,15 +231,18 @@ export function AttachmentListTable({
       ),
       cell: ({ row }) => {
         const date = new Date(row.original.date)
-        const title = format(date, 'yyyy-MM-dd HH:mm:ss')
+        const absolute = format(date, 'yyyy-MM-dd HH:mm')
+        const relative = formatDistanceToNow(date, { addSuffix: true, locale })
         return (
           <Tooltip>
             <TooltipTrigger asChild>
               <span className='text-xs whitespace-nowrap'>
-                {formatDistanceToNow(date, { addSuffix: true, locale })}
+                {dateDisplay === 'absolute' ? absolute : relative}
               </span>
             </TooltipTrigger>
-            <TooltipContent>{title}</TooltipContent>
+            <TooltipContent>
+              {dateDisplay === 'absolute' ? relative : format(date, 'yyyy-MM-dd HH:mm:ss')}
+            </TooltipContent>
           </Tooltip>
         )
       },

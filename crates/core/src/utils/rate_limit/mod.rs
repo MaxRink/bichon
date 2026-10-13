@@ -26,7 +26,7 @@ use governor::{
 use std::{
     num::NonZero,
     sync::{Arc, LazyLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::users::acl::RateLimit;
@@ -98,5 +98,37 @@ impl UserRateLimiter {
             .value()
             .0
             .clone()
+    }
+}
+
+pub static LOGIN_RATE_LIMITER_MANAGER: LazyLock<LoginRateLimiter> = LazyLock::new(LoginRateLimiter::new);
+
+pub struct LoginRateLimiter {
+    limiters: Arc<
+        DashMap<
+            String,
+            (Arc<RateLimiter<NotKeyed, InMemoryState, QuantaClock, NoOpMiddleware>>, Instant),
+        >,
+    >,
+}
+
+impl LoginRateLimiter {
+    pub fn new() -> Self {
+        LoginRateLimiter {
+            limiters: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub async fn check(&self, ip: &str) -> Result<(), NotUntil<QuantaInstant>> {
+        const ENTRY_TTL: Duration = Duration::from_secs(600);
+        self.limiters.retain(|_, (_, last_seen)| last_seen.elapsed() <= ENTRY_TTL);
+        let mut entry = self.limiters.entry(ip.to_string()).or_insert_with(|| {
+            let quota = Quota::with_period(Duration::from_secs(600))
+                .unwrap()
+                .allow_burst(NonZero::new(10).unwrap());
+            (Arc::new(RateLimiter::direct_with_clock(quota, QuantaClock::default())), Instant::now())
+        });
+        entry.value_mut().1 = Instant::now();
+        entry.value().0.check()
     }
 }

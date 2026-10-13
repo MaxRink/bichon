@@ -80,7 +80,8 @@ const VirtualizedCommand = ({
     setFilteredOptions(
       options.filter((option) =>
         option.value.toLowerCase().includes(search.toLowerCase()) ||
-        option.label.toLowerCase().includes(search.toLowerCase())
+        option.label.toLowerCase().includes(search.toLowerCase()) ||
+        (option.description ?? '').toLowerCase().includes(search.toLowerCase())
       ),
     );
   };
@@ -275,6 +276,9 @@ export function VirtualizedSelect({
       .filter(Boolean);
 
     if (selectedLabels.length === 0) return placeholder;
+    if (selectedLabels.length > 2) {
+      return `${selectedLabels.slice(0, 2).join(', ')}, +${selectedLabels.length - 2}`;
+    }
     return selectedLabels.join(", ");
   };
 

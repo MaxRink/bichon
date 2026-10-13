@@ -1,4 +1,4 @@
-import { ReactNode } from 'react'
+import { ReactNode, useEffect, useState } from 'react'
 import { Link, useLocation } from '@tanstack/react-router'
 import { ChevronRight } from 'lucide-react'
 import {
@@ -28,33 +28,98 @@ import {
 } from '../ui/dropdown-menu'
 import { NavCollapsible, NavItem, NavLink, type NavGroup } from './types'
 
-export function NavGroup({ title, items }: NavGroup) {
+// One localStorage key holding the open/close state of every nav group (a
+// JSON object keyed by group id), so a reload restores the sidebar the user
+// last had it in. Deliberately a single key rather than one per group.
+const NAV_GROUP_STORAGE_KEY = 'bichon.sidebar.nav-group-state'
+
+function readStoredOpen(id: string): boolean | undefined {
+  try {
+    const state = JSON.parse(localStorage.getItem(NAV_GROUP_STORAGE_KEY) ?? '{}')
+    return typeof state[id] === 'boolean' ? state[id] : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function storeOpen(id: string, open: boolean) {
+  try {
+    const state = JSON.parse(localStorage.getItem(NAV_GROUP_STORAGE_KEY) ?? '{}')
+    state[id] = open
+    localStorage.setItem(NAV_GROUP_STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    // localStorage unavailable (blocked / quota / private mode) — best effort.
+  }
+}
+
+export function NavGroup({ id, title, items, defaultOpen }: NavGroup) {
   const { state } = useSidebar()
   const href = useLocation({ select: (location) => location.href })
 
   const visibleItems = items.filter(item => item.visible !== false)
 
+  // A group is "active" when any of its (sub)items matches the current route.
+  // The section you are in is never hidden (it starts open and re-opens on
+  // navigation); otherwise the user's stored choice wins, else `defaultOpen`.
+  const isActive = visibleItems.some(item => checkIsActive(href, item, true))
+  const [open, setOpen] = useState(() => {
+    if (isActive) return true
+    const stored = readStoredOpen(id)
+    if (typeof stored === 'boolean') return stored
+    return !!defaultOpen
+  })
+
+  useEffect(() => {
+    if (isActive) setOpen(true)
+  }, [isActive])
+
+  // Persist the current open/close choice (including auto-opens from
+  // navigation, which match what the user sees) so reloads restore it.
+  useEffect(() => {
+    storeOpen(id, open)
+  }, [id, open])
+
   if (visibleItems.length === 0) return null
 
+  // In icon-collapsed mode the groups render as a plain icon rail, so every
+  // group must stay expanded (collapsing is disabled) to keep all icons visible.
+  const isOpen = state === 'collapsed' ? true : open
+
   return (
-    <SidebarGroup>
-      <SidebarGroupLabel>{title}</SidebarGroupLabel>
-      <SidebarMenu>
-        {visibleItems.map((item) => {
-          const key = `${item.title}-${item.url}`
+    <Collapsible
+      asChild
+      open={isOpen}
+      onOpenChange={(next) => {
+        if (state !== 'collapsed') setOpen(next)
+      }}
+      className='group/group'
+    >
+      <SidebarGroup>
+        <CollapsibleTrigger asChild>
+          <SidebarGroupLabel className='cursor-pointer select-none'>
+            {title}
+            <ChevronRight className='ml-auto transition-transform duration-200 group-data-[state=open]/group:rotate-90' />
+          </SidebarGroupLabel>
+        </CollapsibleTrigger>
+        <CollapsibleContent className='CollapsibleContent'>
+          <SidebarMenu>
+            {visibleItems.map((item) => {
+              const key = `${item.title}-${item.url}`
 
-          if (!item.items)
-            return <SidebarMenuLink key={key} item={item} href={href} />
+              if (!item.items)
+                return <SidebarMenuLink key={key} item={item} href={href} />
 
-          if (state === 'collapsed')
-            return (
-              <SidebarMenuCollapsedDropdown key={key} item={item} href={href} />
-            )
+              if (state === 'collapsed')
+                return (
+                  <SidebarMenuCollapsedDropdown key={key} item={item} href={href} />
+                )
 
-          return <SidebarMenuCollapsible key={key} item={item} href={href} />
-        })}
-      </SidebarMenu>
-    </SidebarGroup>
+              return <SidebarMenuCollapsible key={key} item={item} href={href} />
+            })}
+          </SidebarMenu>
+        </CollapsibleContent>
+      </SidebarGroup>
+    </Collapsible>
   )
 }
 

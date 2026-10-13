@@ -228,8 +228,8 @@ pub struct OAuth2UpdateRequest {
     /// Indicates whether this configuration is enabled or disabled.
     pub enabled: Option<bool>,
 
-    /// route OAuth through proxy (when direct access is blocked)
-    pub use_proxy: Option<u64>,
+    /// `None` means omitted; `Some(None)` explicitly clears the proxy.
+    pub use_proxy: Option<Option<u64>>,
 }
 
 fn apply_update(old: &OAuth2, request: OAuth2UpdateRequest) -> BichonResult<OAuth2> {
@@ -262,7 +262,7 @@ fn apply_update(old: &OAuth2, request: OAuth2UpdateRequest) -> BichonResult<OAut
         new.enabled = enabled;
     }
     if let Some(use_proxy) = request.use_proxy {
-        new.use_proxy = Some(use_proxy);
+        new.use_proxy = use_proxy;
     }
     new.updated_at = utc_now!();
     Ok(new)

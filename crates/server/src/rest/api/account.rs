@@ -24,12 +24,13 @@ use bichon_core::account::migration::{AccountModel, AccountType};
 use bichon_core::account::payload::{
     filter_accessible_accounts, AccountCreateRequest, AccountUpdateRequest, MinimalAccount,
 };
-use bichon_core::account::state::DownloadState;
+use bichon_core::account::state::{DownloadState, GapFillState};
 use bichon_core::account::stats::AccountStats;
 use bichon_core::account::view::AccountResp;
-use bichon_core::cache::imap::task::SYNC_TASKS;
+use bichon_core::archive::imap::task::SYNC_TASKS;
 use bichon_core::common::paginated::{paginate_vec, DataPage};
 use bichon_core::error::code::ErrorCode;
+use bichon_core::ext::event_bus::{emit, Event};
 use bichon_core::raise_error;
 use bichon_core::store::tantivy::envelope::ENVELOPE_MANAGER;
 use bichon_core::users::permissions::Permission;
@@ -37,9 +38,21 @@ use bichon_core::users::UserModel;
 use poem_openapi::param::{Path, Query};
 use poem_openapi::payload::Json;
 use poem_openapi::OpenApi;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 pub struct AccountApi;
+
+/// Request body for `POST /accounts/:account_id/start-download`.
+/// `Default` keeps the handler working for older clients that send no body.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, poem_openapi::Object)]
+pub struct StartDownloadRequest {
+    /// When true, run the gap-fill phase (enumerate all UIDs in the download
+    /// folders and download anything missing locally) after the incremental
+    /// sync. Defaults to false; omitted by older clients.
+    #[serde(default)]
+    pub run_gap_fill: bool,
+}
 
 #[OpenApi(prefix_path = "/api/v1", tag = "ApiTags::Account")]
 impl AccountApi {
@@ -74,7 +87,15 @@ impl AccountApi {
     ) -> ApiResult<()> {
         let account_id = account_id.0;
         context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
+        let email = AccountModel::find(account_id)?
+            .map(|a| a.email)
+            .unwrap_or_else(|| format!("account-{account_id}"));
         AccountModel::delete(account_id).await?;
+        emit(Event::AccountRemoved {
+            removed_by: context.user.username.clone(),
+            account_id,
+            email,
+        });
         Ok(())
     }
 
@@ -88,6 +109,11 @@ impl AccountApi {
     ) -> ApiResult<Json<AccountModel>> {
         context.require_permission(None, Permission::ACCOUNT_CREATE)?;
         let account = AccountModel::create_account(context.user.id, payload.0).await?;
+        emit(Event::AccountCreated {
+            created_by: context.user.username.clone(),
+            account_id: account.id,
+            email: account.email.clone(),
+        });
         Ok(Json(account))
     }
 
@@ -107,7 +133,16 @@ impl AccountApi {
     ) -> ApiResult<()> {
         let account_id = account_id.0;
         context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
-        Ok(AccountModel::update(account_id, payload.0, true)?)
+        AccountModel::update(account_id, payload.0, true)?;
+        let email = AccountModel::find(account_id)?
+            .map(|a| a.email)
+            .unwrap_or_else(|| format!("account-{account_id}"));
+        emit(Event::AccountUpdated {
+            updated_by: context.user.username.clone(),
+            account_id,
+            email,
+        });
+        Ok(())
     }
 
     /// List accounts with optional pagination parameters
@@ -196,6 +231,30 @@ impl AccountApi {
         Ok(Json(state))
     }
 
+    /// Get the gap-fill history of an account (independent of download sessions)
+    #[oai(
+        path = "/accounts/:account_id/gap-fill-stats",
+        method = "get",
+        operation_id = "accounts_gap_fill_state"
+    )]
+    async fn accounts_gap_fill_state(
+        &self,
+        /// The account ID to check gap-fill state for
+        account_id: Path<u64>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<GapFillState>> {
+        let account_id = account_id.0;
+        AccountModel::check_account_exists(account_id)?;
+        context.require_permission(Some(account_id), Permission::ACCOUNT_READ_DETAILS)?;
+        let state = GapFillState::get(account_id)?;
+        let state = state.unwrap_or(GapFillState {
+            account_id,
+            active: None,
+            history: Vec::new(),
+        });
+        Ok(Json(state))
+    }
+
     /// Start a manual download task for an account
     #[oai(
         path = "/accounts/:account_id/start-download",
@@ -206,6 +265,7 @@ impl AccountApi {
         &self,
         /// The account ID to start download for
         account_id: Path<u64>,
+        body: Json<StartDownloadRequest>,
         context: WrappedContext,
     ) -> ApiResult<()> {
         let account_id = account_id.0;
@@ -217,7 +277,12 @@ impl AccountApi {
             ))?;
         }
         context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
-        SYNC_TASKS.start_manual_task(account_id).await?;
+        SYNC_TASKS.start_manual_task(account_id, body.run_gap_fill).await?;
+        emit(Event::AccountDownloadStarted {
+            user: context.user.username.clone(),
+            account_id,
+            run_gap_fill: body.run_gap_fill,
+        });
         Ok(())
     }
 
@@ -251,6 +316,10 @@ impl AccountApi {
             ))?;
         }
         SYNC_TASKS.cancel_manual_task(account_id).await;
+        emit(Event::AccountDownloadStopped {
+            user: context.user.username.clone(),
+            account_id,
+        });
         Ok(())
     }
 
@@ -306,8 +375,25 @@ impl AccountApi {
         req: Json<BatchAccountRoleRequest>,
         context: WrappedContext,
     ) -> ApiResult<()> {
+        let req = req.0;
         req.validate_existence()?;
-        req.0.do_assign(&context)?;
+        let role_name = bichon_core::users::role::UserRole::find(req.role_id)?
+            .map(|r| r.name)
+            .unwrap_or_else(|| format!("role-{}", req.role_id));
+        let target_users: Vec<String> = req
+            .user_ids
+            .iter()
+            .filter_map(|uid| UserModel::find(*uid).ok().flatten())
+            .map(|u| u.username)
+            .collect();
+        let account_count = req.account_ids.len();
+        req.do_assign(&context)?;
+        emit(Event::AccountRoleAssigned {
+            user: context.user.username.clone(),
+            target_user: target_users.join(", "),
+            account_count,
+            roles: vec![role_name],
+        });
         Ok(())
     }
 }

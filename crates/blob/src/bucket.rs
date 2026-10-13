@@ -1,11 +1,14 @@
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use redb::{Database, ReadableTable, TableDefinition};
+use redb::ReadableDatabase;
 
 use crate::error::Result;
-use crate::types::{BUCKET_COUNT, INDEX_RECORD_SIZE};
+use crate::types::INDEX_RECORD_SIZE;
 
-/// On-disk format: 52 bytes per record.
+// ── IndexRecord ──────────────────────────────────────────────────────────────
+
+/// On-disk format: 52 bytes per record + 4 bytes CRC = 56 bytes total.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRecord {
     pub key: [u8; 32],
@@ -37,293 +40,245 @@ impl IndexRecord {
         buf[36..44].copy_from_slice(&self.offset.to_le_bytes());
         buf[44..48].copy_from_slice(&self.data_size.to_le_bytes());
         buf[48] = self.flags;
-        // bytes 49..52 are padding (keep zero)
+        let crc = crate::checksum::crc32(&buf[..52]);
+        buf[52..56].copy_from_slice(&crc.to_le_bytes());
         buf
     }
 
-    pub fn decode(buf: &[u8; INDEX_RECORD_SIZE]) -> Self {
+    pub fn decode(buf: &[u8; INDEX_RECORD_SIZE]) -> crate::error::Result<Self> {
+        let stored_crc = u32::from_le_bytes(buf[52..56].try_into().unwrap());
+        let computed = crate::checksum::crc32(&buf[..52]);
+        if stored_crc != computed {
+            return Err(crate::error::Error::BucketIndexCorrupt {
+                path: std::path::PathBuf::new(),
+                reason: format!(
+                    "CRC mismatch: stored=0x{:08X} computed=0x{:08X}",
+                    stored_crc, computed
+                ),
+            });
+        }
         let mut key = [0u8; 32];
         key.copy_from_slice(&buf[0..32]);
         let segment_id = u32::from_le_bytes(buf[32..36].try_into().unwrap());
         let offset = u64::from_le_bytes(buf[36..44].try_into().unwrap());
         let data_size = u32::from_le_bytes(buf[44..48].try_into().unwrap());
         let flags = buf[48];
-        Self {
+        Ok(Self {
             key,
             segment_id,
             offset,
             data_size,
             flags,
-        }
+        })
     }
 }
 
-/// Represents a loaded and deduplicated bucket in memory.
-pub struct BucketIndex {
-    pub bucket_id: u16,
-    /// Records sorted by key, deduplicated (one record per key, latest wins).
-    pub records: Vec<IndexRecord>,
+// ── redb Value impl for fixed-size record bytes ──────────────────────────────
+
+/// Newtype wrapper so we can implement `redb::Value` for `[u8; INDEX_RECORD_SIZE]`.
+#[derive(Debug, Clone, Copy)]
+struct RecordBytes([u8; INDEX_RECORD_SIZE]);
+
+impl redb::Value for RecordBytes {
+    type SelfType<'a> = RecordBytes;
+    type AsBytes<'a> = [u8; INDEX_RECORD_SIZE];
+
+    fn fixed_width() -> Option<usize> {
+        Some(INDEX_RECORD_SIZE)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a
+    {
+        let mut arr = [0u8; INDEX_RECORD_SIZE];
+        arr.copy_from_slice(data);
+        RecordBytes(arr)
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a> {
+        value.0
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("IndexRecord")
+    }
 }
 
-impl BucketIndex {
-    /// Build from raw records: sort by key, dedup keeping the one with max offset.
-    pub fn from_records(mut records: Vec<IndexRecord>, bucket_id: u16) -> Self {
-        records.sort_by_key(|a| a.key);
-        // Dedup: keep last (max offset) for each key
-        let mut deduped = Vec::with_capacity(records.len());
-        let mut i = 0;
-        while i < records.len() {
-            let mut best = i;
-            let mut j = i + 1;
-            while j < records.len() && records[j].key == records[i].key {
-                if records[j].offset > records[best].offset {
-                    best = j;
-                }
-                j += 1;
+// ── IndexStore ───────────────────────────────────────────────────────────────
+
+const INDEX_TABLE: TableDefinition<[u8; 32], RecordBytes> = TableDefinition::new("blob_index");
+
+/// Zero-heap key-value index backed by redb.
+///
+/// B-tree + mmap + ACID.  No manual compact / sort / dedup / per-bucket mmap
+/// management.  Startup is O(1) — redb reads only its root page.
+pub struct IndexStore {
+    db: Database,
+    path: std::path::PathBuf,
+}
+
+impl IndexStore {
+    /// Open (or create) the index database at `dir/index.redb`.
+    pub fn open(dir: &Path) -> Result<Self> {
+        let path = dir.join("index.redb");
+        let db = Database::create(&path)
+            .map_err(|e| crate::error::Error::IndexDb(format!("failed to create index: {}", e)))?;
+        // Ensure the table exists so reads on a fresh database don't fail.
+        {
+            let txn = db
+                .begin_write()
+                .map_err(|e| crate::error::Error::IndexDb(format!("init write txn: {}", e)))?;
+            txn.open_table(INDEX_TABLE)
+                .map_err(|e| crate::error::Error::IndexDb(format!("init table: {}", e)))?;
+            txn.commit()
+                .map_err(|e| crate::error::Error::IndexDb(format!("init commit: {}", e)))?;
+        }
+        Ok(Self { db, path })
+    }
+
+    /// Look up a key. Returns the latest IndexRecord, or None if absent/tombstone.
+    pub fn get(&self, key: &[u8; 32]) -> Result<Option<IndexRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| crate::error::Error::IndexDb(format!("read txn: {}", e)))?;
+        let table = txn
+            .open_table(INDEX_TABLE)
+            .map_err(|e| crate::error::Error::IndexDb(format!("open table: {}", e)))?;
+
+        match table
+            .get(key)
+            .map_err(|e| crate::error::Error::IndexDb(format!("get: {}", e)))?
+        {
+            Some(guard) => {
+                let record = IndexRecord::decode(&guard.value().0)?;
+                Ok(if record.is_tombstone() { None } else { Some(record) })
             }
-            deduped.push(records[best].clone());
-            i = j;
-        }
-        Self {
-            bucket_id,
-            records: deduped,
+            None => Ok(None),
         }
     }
 
-    /// Binary search for a key. Returns the record if found.
-    pub fn find(&self, key: &[u8; 32]) -> Option<&IndexRecord> {
-        match self.records.binary_search_by(|r| r.key.cmp(key)) {
-            Ok(idx) => Some(&self.records[idx]),
-            Err(_) => None,
+    /// Check whether a key exists (non-tombstone) in the store.
+    pub fn exists(&self, key: &[u8; 32]) -> Result<bool> {
+        self.get(key).map(|r| r.is_some())
+    }
+
+    /// Insert or update a record for a key.  Committed in a single write txn.
+    pub fn insert(&self, record: &IndexRecord) -> Result<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| crate::error::Error::IndexDb(format!("write txn: {}", e)))?;
+        {
+            let mut table = txn
+                .open_table(INDEX_TABLE)
+                .map_err(|e| crate::error::Error::IndexDb(format!("open table: {}", e)))?;
+            table
+                .insert(&record.key, RecordBytes(record.encode()))
+                .map_err(|e| crate::error::Error::IndexDb(format!("insert: {}", e)))?;
         }
-    }
-
-    /// Append a new record and maintain sorted order.
-    pub fn insert(&mut self, record: IndexRecord) {
-        match self.records.binary_search_by(|r| r.key.cmp(&record.key)) {
-            Ok(idx) => {
-                // Replace if newer (larger offset)
-                if record.offset > self.records[idx].offset {
-                    self.records[idx] = record;
-                }
-            }
-            Err(idx) => {
-                self.records.insert(idx, record);
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-}
-
-/// Manages a bucket index file on disk.
-pub struct BucketFile {
-    path: PathBuf,
-    bucket_id: u16,
-}
-
-impl BucketFile {
-    pub fn path_for(account_dir: &Path, bucket_id: u16) -> PathBuf {
-        account_dir.join("buckets").join(format!("{:02x}.idx", bucket_id))
-    }
-
-    pub fn open(account_dir: &Path, bucket_id: u16) -> Self {
-        Self {
-            path: Self::path_for(account_dir, bucket_id),
-            bucket_id,
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn bucket_id(&self) -> u16 {
-        self.bucket_id
-    }
-
-    /// Ensure the buckets directory exists.
-    pub fn ensure_dir(account_dir: &Path) -> Result<()> {
-        let dir = account_dir.join("buckets");
-        std::fs::create_dir_all(&dir)?;
+        txn.commit()
+            .map_err(|e| crate::error::Error::IndexDb(format!("commit: {}", e)))?;
         Ok(())
     }
 
-    /// Append a single record to the bucket file.
-    pub fn append(&self, record: &IndexRecord) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        file.write_all(&record.encode())?;
-        Ok(())
-    }
-
-    /// Append multiple records at once.
-    pub fn append_batch(&self, records: &[IndexRecord]) -> Result<()> {
+    /// Batch insert multiple records in a single write transaction.
+    pub fn insert_batch(&self, records: &[IndexRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        for r in records {
-            file.write_all(&r.encode())?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| crate::error::Error::IndexDb(format!("write txn: {}", e)))?;
+        {
+            let mut table = txn
+                .open_table(INDEX_TABLE)
+                .map_err(|e| crate::error::Error::IndexDb(format!("open table: {}", e)))?;
+            for record in records {
+                table
+                    .insert(&record.key, RecordBytes(record.encode()))
+                    .map_err(|e| crate::error::Error::IndexDb(format!("insert: {}", e)))?;
+            }
         }
+        txn.commit()
+            .map_err(|e| crate::error::Error::IndexDb(format!("commit: {}", e)))?;
         Ok(())
     }
 
-    /// Load all records from the bucket file.
-    /// If the file size is not a multiple of INDEX_RECORD_SIZE (partial write),
-    /// the trailing bytes are silently ignored.
-    pub fn load_all(&self) -> Result<Vec<IndexRecord>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
+    /// Remove keys from the index in a single write transaction.
+    pub fn delete_batch(&self, keys: &[[u8; 32]]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
         }
-        let data = std::fs::read(&self.path)?;
-        let remainder = data.len() % INDEX_RECORD_SIZE;
-        let count = data.len() / INDEX_RECORD_SIZE;
-        let mut records = Vec::with_capacity(count);
-        for i in 0..count {
-            let start = i * INDEX_RECORD_SIZE;
-            let end = start + INDEX_RECORD_SIZE;
-            let buf: &[u8; INDEX_RECORD_SIZE] = data[start..end]
-                .try_into()
-                .map_err(|_| crate::error::Error::BucketIndexCorrupt {
-                    path: self.path.clone(),
-                    reason: format!("unexpected file size {}, not a multiple of {}", data.len(), INDEX_RECORD_SIZE),
-                })?;
-            records.push(IndexRecord::decode(buf));
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| crate::error::Error::IndexDb(format!("write txn: {}", e)))?;
+        {
+            let mut table = txn
+                .open_table(INDEX_TABLE)
+                .map_err(|e| crate::error::Error::IndexDb(format!("open table: {}", e)))?;
+            for key in keys {
+                table
+                    .remove(key)
+                    .map_err(|e| crate::error::Error::IndexDb(format!("remove: {}", e)))?;
+            }
         }
-        if remainder > 0 {
-            tracing::warn!(
-                "Bucket file {:?} has {} trailing bytes (expected multiple of {}), ignoring",
-                self.path, remainder, INDEX_RECORD_SIZE
-            );
-        }
-        Ok(records)
-    }
-
-    /// Load all records, sort, and deduplicate into a BucketIndex.
-    pub fn load_index(&self) -> Result<BucketIndex> {
-        let records = self.load_all()?;
-        Ok(BucketIndex::from_records(records, self.bucket_id))
-    }
-
-    /// Rewrite the bucket file with a sorted, deduplicated set of records.
-    /// Uses atomic temp+rename to be safe on NFS.
-    pub fn rewrite(&self, records: &[IndexRecord]) -> Result<()> {
-        let mut buf = Vec::with_capacity(records.len() * INDEX_RECORD_SIZE);
-        for r in records {
-            buf.extend_from_slice(&r.encode());
-        }
-        crate::fs::create_atomic(&self.path, &buf)
-    }
-
-    /// Delete the bucket file.
-    pub fn delete(&self) -> Result<()> {
-        if self.path.exists() {
-            std::fs::remove_file(&self.path)?;
-        }
+        txn.commit()
+            .map_err(|e| crate::error::Error::IndexDb(format!("commit: {}", e)))?;
         Ok(())
     }
-}
 
-/// Compute bucket_id from a key's first 2 bytes.
-pub fn bucket_id(key: &[u8; 32]) -> u16 {
-    u16::from_be_bytes([key[0], key[1]]) % BUCKET_COUNT
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_index_record_encode_decode() {
-        let mut key = [0u8; 32];
-        key[0..4].copy_from_slice(&[1, 2, 3, 4]);
-        let rec = IndexRecord::new(key, 5, 12345, 500, 0);
-        let encoded = rec.encode();
-        let decoded = IndexRecord::decode(&encoded);
-        assert_eq!(rec, decoded);
+    /// Flush all pending index writes to stable storage.
+    ///
+    /// redb is an mmap'd copy-on-write database with no public flush API: the
+    /// OS may still hold dirty pages after a commit. We commit a no-op write
+    /// transaction (runs redb's write path so the latest state is reflected in
+    /// the mapped file) and then fsync the file itself, which pushes every
+    /// mmap-dirtied page to disk. Called by the backup manager inside a write
+    /// window so a subsequent external copy of `index.redb` is durable.
+    pub fn flush(&self) -> Result<()> {
+        {
+            let txn = self
+                .db
+                .begin_write()
+                .map_err(|e| crate::error::Error::IndexDb(format!("flush write txn: {}", e)))?;
+            txn.open_table(INDEX_TABLE)
+                .map_err(|e| crate::error::Error::IndexDb(format!("flush open table: {}", e)))?;
+            txn.commit()
+                .map_err(|e| crate::error::Error::IndexDb(format!("flush commit: {}", e)))?;
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&self.path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| crate::error::Error::IndexDb(format!("flush: {}", e)))
     }
 
-    #[test]
-    fn test_bucket_id_deterministic() {
-        let mut key = [0u8; 32];
-        key[0] = 0x00;
-        key[1] = 0x0F;
-        assert_eq!(bucket_id(&key), 15);
-        key[0] = 0x00;
-        key[1] = 0x10;
-        assert_eq!(bucket_id(&key), 0);
-    }
+    /// Total number of live (non-tombstone) keys.
+    pub fn total_keys(&self) -> Result<usize> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| crate::error::Error::IndexDb(format!("read txn: {}", e)))?;
+        let table = txn
+            .open_table(INDEX_TABLE)
+            .map_err(|e| crate::error::Error::IndexDb(format!("open table: {}", e)))?;
 
-    #[test]
-    fn test_bucket_append_and_load() {
-        let dir = TempDir::new().unwrap();
-        let bucket = BucketFile::open(dir.path(), 0);
-        BucketFile::ensure_dir(dir.path()).unwrap();
-
-        let r1 = IndexRecord::new([1u8; 32], 1, 100, 50, 0);
-        let r2 = IndexRecord::new([2u8; 32], 1, 200, 60, 0);
-
-        bucket.append(&r1).unwrap();
-        bucket.append(&r2).unwrap();
-
-        let loaded = bucket.load_all().unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].key, [1u8; 32]);
-        assert_eq!(loaded[1].key, [2u8; 32]);
-    }
-
-    #[test]
-    fn test_bucket_index_dedup() {
-        let recs = vec![
-            IndexRecord::new([1u8; 32], 1, 100, 50, 0),
-            IndexRecord::new([1u8; 32], 2, 200, 50, 0), // newer offset wins
-            IndexRecord::new([2u8; 32], 1, 300, 60, 0),
-        ];
-        let idx = BucketIndex::from_records(recs, 0);
-        assert_eq!(idx.len(), 2);
-        let found = idx.find(&[1u8; 32]).unwrap();
-        assert_eq!(found.segment_id, 2);
-        assert_eq!(found.offset, 200);
-    }
-
-    #[test]
-    fn test_bucket_index_find_missing() {
-        let recs = vec![IndexRecord::new([1u8; 32], 1, 100, 50, 0)];
-        let idx = BucketIndex::from_records(recs, 0);
-        assert!(idx.find(&[99u8; 32]).is_none());
-    }
-
-    #[test]
-    fn test_bucket_rewrite() {
-        let dir = TempDir::new().unwrap();
-        let bucket = BucketFile::open(dir.path(), 0);
-        BucketFile::ensure_dir(dir.path()).unwrap();
-
-        let r1 = IndexRecord::new([3u8; 32], 1, 300, 70, 0);
-        let r2 = IndexRecord::new([1u8; 32], 1, 100, 50, 0);
-        bucket.append(&r1).unwrap();
-        bucket.append(&r2).unwrap();
-
-        // Rewrite sorted
-        let sorted = vec![r2.clone(), r1.clone()];
-        bucket.rewrite(&sorted).unwrap();
-
-        let loaded = bucket.load_all().unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].key, [1u8; 32]);
-        assert_eq!(loaded[1].key, [3u8; 32]);
+        let mut count = 0usize;
+        let iter = table
+            .iter()
+            .map_err(|e| crate::error::Error::IndexDb(format!("iter: {}", e)))?;
+        for item in iter {
+            let (_, guard) =
+                item.map_err(|e| crate::error::Error::IndexDb(format!("iter next: {}", e)))?;
+            let record = IndexRecord::decode(&guard.value().0)?;
+            if !record.is_tombstone() {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 }

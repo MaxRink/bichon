@@ -34,6 +34,7 @@ import { TabGeneral } from "./components/tab-general";
 import { TabServer } from "./components/tab-server";
 import { TabDownload } from "./components/tab-download";
 import { TabFilters } from "./components/tab-filters";
+import { TabRetention } from "./components/tab-retention";
 import { create_account, autoconfig } from "@/api/account/api";
 import { getAccountSchema, type AccountFormValues } from "./components/schema";
 import type { AxiosError } from "axios";
@@ -59,6 +60,8 @@ const defaultValues: AccountFormValues = {
   auto_download_new_mailboxes: true,
   download_schedule: undefined,
   archive_rules: undefined,
+  extraction_rules: undefined,
+  retention_days: undefined,
 };
 
 function SectionHeader({ title, description }: { title: string; description?: string }) {
@@ -111,12 +114,15 @@ export function AccountNewPage() {
 
   const onSubmit = useCallback(
     (data: AccountFormValues) => {
+      const { use_proxy, ...imapRest } = data.imap;
       createMutation.mutate({
         email: data.email,
-        account_name: data.account_name,
+        // An empty / whitespace-only name means "no name" — send null, never ''.
+        account_name: data.account_name?.trim() ? data.account_name : null,
         login_name: data.login_name,
         imap: {
-          ...data.imap,
+          ...imapRest,
+          use_proxy,
           auth: {
             ...data.imap.auth,
             password: data.imap.auth.auth_type === 'OAuth2' ? undefined : data.imap.auth.password,
@@ -133,6 +139,9 @@ export function AccountNewPage() {
         download_schedule: data.download_schedule || null,
         account_type: "IMAP",
         archive_rules: data.archive_rules || null,
+        extraction_rules: data.extraction_rules || null,
+        // Empty / 0 = keep everything (retention disabled).
+        retention_days: data.retention_days || 0,
       });
     },
     [createMutation]
@@ -231,10 +240,20 @@ export function AccountNewPage() {
 
                   <section>
                     <SectionHeader
-                      title={t('accounts.settings.filters')}
-                      description={t('accounts.settings.filtersDesc')}
+                      title={t('accounts.settings.rules', 'Rules')}
+                      description={t('accounts.settings.rulesDesc', 'Configure archive filtering and attachment extraction rules.')}
                     />
-                    <TabFilters />
+                    <TabFilters collapsedByDefault />
+                  </section>
+
+                  <hr />
+
+                  <section>
+                    <SectionHeader
+                      title={t('accounts.settings.retention', 'Retention')}
+                      description={t('accounts.settings.retentionDesc', 'Automatically purge messages older than a configured window.')}
+                    />
+                    <TabRetention />
                   </section>
 
                   <div className="flex items-center justify-between pt-4 border-t">

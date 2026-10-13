@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
 env:
   BINARY_NAME: bichon-server
   BINARY_CLI: bichon-cli
@@ -66,7 +67,7 @@ jobs:
           node-version: 20
 
       - name: Install pnpm
-        run: npm install -g pnpm
+        run: npm install -g pnpm@10.18.3
 
       - name: Build frontend (web)
         working-directory: ./web

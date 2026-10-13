@@ -17,7 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { Loader, Download, Trash2, MessageSquareMore, FileText, FileImage, FileVideo, FileArchive, FileSpreadsheet, FileCode, FileIcon, FileAudio, Upload, ShieldCheck } from 'lucide-react';
 
@@ -167,7 +167,11 @@ export function MailMessageView({
     setBlockRemote(true);
   }, [envelope.id]);
 
+  const loadedKeyRef = useRef('');
   useEffect(() => {
+    const key = `${envelope.account_id}:${envelope.id}:${blockRemote}`;
+    if (loadedKeyRef.current === key) return;
+    loadedKeyRef.current = key;
     setLoading(true);
     loadMessageMutation.mutate();
   }, [envelope.id, blockRemote]);
@@ -221,7 +225,7 @@ export function MailMessageView({
   };
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col">
       {showHeader && <div className="grid gap-1 text-xs">
         <div className="flex space-x-2">
           <span className="font-medium text-gray-400">{t('mail.account')}:</span>
@@ -424,7 +428,7 @@ export function MailMessageView({
           </span>
         </div>
       )}
-      <div className="flex-1 overflow-auto">
+      <div>
         {loading ? (
           <div className="flex justify-center items-center py-8">
             <Loader className="w-6 h-6 animate-spin" />

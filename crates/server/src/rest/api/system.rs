@@ -21,6 +21,7 @@ use crate::rest::api::ApiTags;
 use crate::rest::ApiResult;
 use bichon_core::dashboard::DashboardStats;
 use bichon_core::error::code::ErrorCode;
+use bichon_core::ext::event_bus::{emit, Event};
 use bichon_core::raise_error;
 use bichon_core::settings::cli::SETTINGS;
 use bichon_core::settings::proxy::{Proxy, ProxyTestResult};
@@ -45,8 +46,12 @@ impl SystemApi {
         path = "/notifications",
         operation_id = "get_notifications"
     )]
-    async fn get_notifications(&self) -> ApiResult<Json<Notifications>> {
-        let notification = fetch_notifications()
+    async fn get_notifications(&self, context: WrappedContext) -> ApiResult<Json<Notifications>> {
+        // The default-password reminder is admin-only: revealing to ordinary
+        // users that the admin password is still the public default would be
+        // a privilege-escalation hint, not a reminder.
+        let is_admin = context.has_permission(None, Permission::USER_MANAGE);
+        let notification = fetch_notifications(is_admin)
             .await
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
         Ok(Json(notification))
@@ -88,7 +93,17 @@ impl SystemApi {
         context: WrappedContext,
     ) -> ApiResult<()> {
         context.require_permission(None, Permission::ROOT)?;
-        Ok(Proxy::delete(id.0)?)
+        let id = id.0;
+        let url = Proxy::get(id)
+            .ok()
+            .map(|p| p.url)
+            .unwrap_or_else(|| format!("proxy-{id}"));
+        Proxy::delete(id)?;
+        emit(Event::ProxyRemoved {
+            user: context.user.username.clone(),
+            url,
+        });
+        Ok(())
     }
 
     /// Retrieve a specific proxy configuration by ID. Requires root permission.
@@ -118,8 +133,14 @@ impl SystemApi {
     #[oai(path = "/proxy", method = "post", operation_id = "create_proxy")]
     async fn create_proxy(&self, url: PlainText<String>, context: WrappedContext) -> ApiResult<()> {
         context.require_permission(None, Permission::ROOT)?;
-        let entity = Proxy::new(url.0);
-        Ok(entity.save()?)
+        let url = url.0;
+        let entity = Proxy::new(url.clone());
+        entity.save()?;
+        emit(Event::ProxyCreated {
+            user: context.user.username.clone(),
+            url,
+        });
+        Ok(())
     }
 
     /// Update the URL of a specific proxy by ID. Requires root permission.
@@ -131,7 +152,14 @@ impl SystemApi {
         context: WrappedContext,
     ) -> ApiResult<()> {
         context.require_permission(None, Permission::ROOT)?;
-        Ok(Proxy::update(id.0, url.0)?)
+        let id = id.0;
+        let url = url.0;
+        Proxy::update(id, url.clone())?;
+        emit(Event::ProxyUpdated {
+            user: context.user.username.clone(),
+            url,
+        });
+        Ok(())
     }
 
     /// Get system configurations.

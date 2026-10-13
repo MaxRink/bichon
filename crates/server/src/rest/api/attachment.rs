@@ -21,6 +21,7 @@ use crate::rest::api::ApiTags;
 use crate::rest::ApiResult;
 use bichon_core::common::paginated::DataPage;
 use bichon_core::error::code::ErrorCode;
+use bichon_core::ext::event_bus::{emit, Event};
 use bichon_core::message::attachment::AttachmentMetadata;
 use bichon_core::message::search::search_attachment_impl;
 use bichon_core::message::search::AttachmentSearchRequest;
@@ -58,7 +59,22 @@ impl AttachmentApi {
             } else {
                 Some(context.user.account_access_map.keys().cloned().collect())
             };
-        Ok(Json(search_attachment_impl(authorized_ids, payload.0)?))
+        let search_text = payload
+            .0
+            .filter()
+            .text
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let result = search_attachment_impl(authorized_ids, payload.0)?;
+        if !search_text.is_empty() {
+            emit(Event::SearchPerformed {
+                query: search_text,
+                user: context.user.username.clone(),
+            });
+        }
+        Ok(Json(result))
     }
 
     /// Retrieves the attachment (metadata) of a specific message.
@@ -131,7 +147,22 @@ impl AttachmentApi {
             context.require_permission(Some(*account_id), Permission::DATA_MANAGE)?;
         }
 
+        let total_updates: u64 = req.updates.values().map(|ids| ids.len() as u64).sum();
+        let updated_accounts: Vec<(u64, u64)> = req
+            .updates
+            .iter()
+            .map(|(account_id, ids)| (*account_id, ids.len() as u64))
+            .collect();
         ATTACHMENT_MANAGER.update_attachment_tags(req).await?;
+        if total_updates > 0 {
+            for (account_id, count) in updated_accounts {
+                emit(Event::AttachmentTagged {
+                    user: context.user.username.clone(),
+                    account_id,
+                    count,
+                });
+            }
+        }
         Ok(())
     }
 

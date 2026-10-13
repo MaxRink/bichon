@@ -17,9 +17,10 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
+import { useState } from 'react'
 import { DotsHorizontalIcon } from '@radix-ui/react-icons'
 import { Row } from '@tanstack/react-table'
-import { IconEdit, IconPlayerPlay, IconPlayerStop, IconShieldLock, IconTrash } from '@tabler/icons-react'
+import { IconClock, IconEdit, IconPlayerPlay, IconPlayerStop, IconShieldLock, IconTrash } from '@tabler/icons-react'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -33,9 +34,12 @@ import { useAccountContext } from '../context'
 import { Mailbox, MessageSquareMore, Settings } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useCurrentUser } from '@/hooks/use-current-user'
-import { AccountModel, cancel_account_download, start_account_download } from '@/api/account/api'
+import { AccountModel, cancel_account_download } from '@/api/account/api'
 import { toast } from '@/hooks/use-toast'
 import { useNavigate } from '@tanstack/react-router'
+import { StartDownloadDialog } from './start-download-dialog'
+import { OP_ACCOUNT_DELETE } from '@/api/approvals/api'
+import { usePendingApprovals } from '@/features/approvals/use-pending-approvals'
 
 interface DataTableRowActionsProps {
   row: Row<AccountModel>
@@ -45,9 +49,16 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const { t } = useTranslation()
   const { setOpen, setCurrentRow } = useAccountContext()
   const navigate = useNavigate()
+  const [startDialogOpen, setStartDialogOpen] = useState(false)
 
   const account_type = row.original.account_type;
   const { require_any_permission } = useCurrentUser()
+
+  // A queued deletion leaves the account exactly as it is, so without this the
+  // row looks untouched and the delete is offered again. Asking twice would
+  // queue two requests for one account.
+  const { hasPendingAccount } = usePendingApprovals()
+  const deleteQueued = hasPendingAccount(OP_ACCOUNT_DELETE, row.original.id)
 
   const hasPermission = require_any_permission(['system:root', 'account:manage'], row.original.id);
   const hasReadPermission = require_any_permission(['system:root', 'account:read_details'], row.original.id);
@@ -56,24 +67,15 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
 
   const canShowAnyAction =
     !isDeleting && (
-    (hasPermission) ||
-    (account_type === 'IMAP' && hasPermission) ||
-    (account_type === 'IMAP' && hasReadPermission)
-  );
+      (hasPermission) ||
+      (account_type === 'IMAP' && hasPermission) ||
+      (account_type === 'IMAP' && hasReadPermission)
+    );
 
   const showDownload = !isDeleting && account_type === 'IMAP' && hasPermission;
 
   const handleStartDownload = async () => {
-    try {
-      await start_account_download(row.original.id);
-      toast({ title: t('accounts.downloadStarted') });
-    } catch (error: any) {
-      toast({
-        variant: "destructive",
-        title: t('accounts.downloadFailed'),
-        description: error.response?.data?.message || error.message
-      });
-    }
+    setStartDialogOpen(true)
   }
 
 
@@ -112,13 +114,14 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
                 setOpen("edit-nosync");
               }
             }}
+            className='text-xs'
           >
             {t('accounts.edit')}
             <DropdownMenuShortcut>
               <IconEdit size={16} />
             </DropdownMenuShortcut>
           </DropdownMenuItem>}
-          {account_type === "IMAP" && hasPermission && <DropdownMenuItem
+          {account_type === "IMAP" && hasPermission && <DropdownMenuItem className='text-xs'
             onClick={() => {
               navigate({ to: '/accounts/$id/settings', params: { id: String(row.original.id) } });
             }}
@@ -129,6 +132,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
             </DropdownMenuShortcut>
           </DropdownMenuItem>}
           {account_type === "IMAP" && hasPermission && <DropdownMenuItem
+            className='text-xs'
             onClick={() => {
               setCurrentRow(row.original)
               setOpen('sync-folders')
@@ -140,6 +144,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
             </DropdownMenuShortcut>
           </DropdownMenuItem>}
           {account_type === "IMAP" && hasReadPermission && <DropdownMenuItem
+            className='text-xs'
             onClick={() => {
               setCurrentRow(row.original)
               setOpen('detail')
@@ -152,6 +157,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuItem>}
           {hasPermission && <DropdownMenuSeparator />}
           {hasPermission && <DropdownMenuItem
+            className='text-xs'
             onClick={() => {
               setCurrentRow(row.original)
               setOpen('access-assign')
@@ -165,7 +171,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           {hasPermission && <DropdownMenuSeparator />}
 
           {showDownload && (
-            <DropdownMenuItem onClick={handleStartDownload}>
+            <DropdownMenuItem onClick={handleStartDownload} className='text-xs'>
               {t('accounts.startDownload')}
               <DropdownMenuShortcut>
                 <IconPlayerPlay size={16} />
@@ -175,7 +181,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
 
 
           {showDownload && (
-            <DropdownMenuItem onClick={handleCancelDownload}>
+            <DropdownMenuItem onClick={handleCancelDownload} className='text-xs'>
               {t('accounts.cancelDownload')}
               <DropdownMenuShortcut>
                 <IconPlayerStop size={16} />
@@ -185,19 +191,32 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           {showDownload && <DropdownMenuSeparator />}
 
           {hasPermission && <DropdownMenuItem
+            disabled={deleteQueued}
             onClick={() => {
               setCurrentRow(row.original)
               setOpen('delete')
             }}
-            className='!text-red-500'
+            className='!text-red-500 text-xs'
           >
             {t('accounts.delete')}
             <DropdownMenuShortcut>
-              <IconTrash size={16} />
+              {deleteQueued ? (
+                <span className='flex items-center gap-1 text-amber-600 dark:text-amber-500'>
+                  <IconClock size={16} />
+                  {t('approvals.pendingBadge', 'Awaiting approval')}
+                </span>
+              ) : (
+                <IconTrash size={16} />
+              )}
             </DropdownMenuShortcut>
           </DropdownMenuItem>}
         </DropdownMenuContent>
       </DropdownMenu>
+      <StartDownloadDialog
+        row={row.original}
+        open={startDialogOpen}
+        onOpenChange={setStartDialogOpen}
+      />
     </>
   )
 }

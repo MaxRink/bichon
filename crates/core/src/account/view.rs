@@ -16,13 +16,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::{
     account::{
         entity::ImapConfig,
-        migration::{AccountModel, AccountType, ArchiveRules, QuotaWindow},
+        migration::{AccountModel, AccountType, ArchiveRules, ExtractionRules, QuotaWindow},
         since::{DateSince, RelativeDate},
     },
     users::UserModel,
@@ -51,7 +51,6 @@ pub struct AccountResp {
     pub created_by: u64, //user id
     pub created_user_name: String,
     pub created_user_email: String,
-    pub use_proxy: Option<u64>,
     pub use_dangerous: bool,
     pub pgp_key: Option<String>,
     pub imap_quota_bytes: Option<u64>,
@@ -59,6 +58,19 @@ pub struct AccountResp {
     pub auto_download_new_mailboxes: Option<bool>,
     pub download_schedule: Option<String>,
     pub archive_rules: Option<ArchiveRules>,
+    /// Attachment text extraction rules (Pro feature); `None` = extract everything.
+    pub extraction_rules: Option<ExtractionRules>,
+    /// Account-level retention window in days (free/community). `None`/`0` = keep everything.
+    pub retention_days: Option<u64>,
+    /// Legal hold flag (Enterprise); while set the retention sweep and bulk deletion skip this account.
+    #[serde(default)]
+    pub legal_hold: bool,
+    /// Reason recorded when the hold was placed.
+    pub hold_reason: Option<String>,
+    /// User id that placed the hold.
+    pub hold_placed_by: Option<u64>,
+    /// Epoch millis when the hold was placed.
+    pub hold_placed_at: Option<i64>,
     pub deleting: bool,
 }
 
@@ -90,7 +102,6 @@ impl AccountResp {
             created_user_email: user
                 .map(|u| u.email.clone())
                 .unwrap_or_else(|| "N/A".to_string()),
-            use_proxy: account.use_proxy,
             use_dangerous: account.use_dangerous,
             pgp_key: account.pgp_key,
             imap_quota_bytes: account.imap_quota_bytes,
@@ -98,6 +109,12 @@ impl AccountResp {
             auto_download_new_mailboxes: account.auto_download_new_mailboxes,
             download_schedule: account.download_schedule,
             archive_rules: account.archive_rules,
+            extraction_rules: account.extraction_rules,
+            retention_days: account.retention_days,
+            legal_hold: account.legal_hold,
+            hold_reason: account.hold_reason,
+            hold_placed_by: account.hold_placed_by,
+            hold_placed_at: account.hold_placed_at,
             deleting: account.deleting,
         }
     }

@@ -17,6 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::account::migration::AccountType;
+use crate::account::state::{DownloadState, GapFillState};
 use crate::context::Initialize;
 use crate::{
     {
@@ -25,7 +26,7 @@ use crate::{
     utc_now,
 };
 use std::sync::LazyLock;
-use tracing::info;
+use tracing::{info, warn};
 
 pub static BICHON_CONTEXT: LazyLock<BichonContext> = LazyLock::new(BichonContext::new);
 
@@ -35,7 +36,17 @@ pub struct BichonContext {
 
 impl Initialize for BichonContext {
     async fn initialize() -> BichonResult<()> {
-        BICHON_CONTEXT.start_account_downloader().await
+        BICHON_CONTEXT.start_account_downloader().await?;
+        // Account-level retention sweep (free/community feature). Both the
+        // community and Pro servers initialize through this hook, so the
+        // scheduler starts exactly once per process.
+        crate::retention::start_retention_scheduler();
+        // Built-in backup subsystem (community preparers + scheduler). The Pro
+        // binary registers its own preparers *before* this hook runs, so
+        // `register_base_preparers` plus the Pro additions are all in place
+        // before any backup window can open.
+        crate::backup::init();
+        Ok(())
     }
 }
 
@@ -65,6 +76,45 @@ impl BichonContext {
             active_accounts.len()
         );
         for account in active_accounts {
+            // A Running session surviving startup is a leftover from a previous
+            // interrupted run; nothing is downloading yet at this point. Mark it
+            // Cancelled so the UI doesn't show a phantom "syncing" state. The
+            // scheduler starts regardless — its first tick runs immediately, so
+            // the interrupted run is caught up on, and the session's trigger
+            // stays Scheduled rather than showing a "Manual" the user never
+            // initiated.
+            match DownloadState::finalize_stale_session(account.id) {
+                Ok(true) => {
+                    info!(
+                        "Account {}: stale sync session finalized on startup.",
+                        account.id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to finalize stale session for account {}: {:#?}",
+                        account.id, e
+                    );
+                }
+                Ok(false) => {}
+            }
+            // Same for a leftover gap-fill run: a Running active run surviving
+            // startup is a phantom — nothing is scanning at this point.
+            match GapFillState::finalize_stale_run(account.id) {
+                Ok(true) => {
+                    info!(
+                        "Account {}: stale gap-fill run finalized on startup.",
+                        account.id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to finalize stale gap-fill run for account {}: {:#?}",
+                        account.id, e
+                    );
+                }
+                Ok(false) => {}
+            }
             DOWNLOAD_CONTROLLER
                 .trigger_schedule(account.id, account.email)
                 .await

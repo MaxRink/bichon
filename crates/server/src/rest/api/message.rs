@@ -21,7 +21,9 @@ use crate::rest::api::ApiTags;
 use crate::rest::ApiResult;
 use bichon_core::account::migration::AccountModel;
 use bichon_core::common::paginated::DataPage;
+use bichon_core::envelope::extractor::{repair_envelope_blobs, BlobRepairReport};
 use bichon_core::error::code::ErrorCode;
+use bichon_core::ext::event_bus::{emit, Event};
 use bichon_core::message::append::restore_emails;
 use bichon_core::message::append::RestoreMessagesRequest;
 use bichon_core::message::attachment::retrieve_attachment_content;
@@ -29,7 +31,7 @@ use bichon_core::message::attachment::retrieve_nested_attachment_content;
 use bichon_core::message::content::retrieve_nested_eml_content;
 use bichon_core::message::content::FullNestedMessageContent;
 use bichon_core::message::content::{retrieve_email_content, FullMessageContent};
-use bichon_core::message::delete::delete_messages_impl;
+use bichon_core::message::delete::{delete_messages_impl, emit_delete_audit, plan_delete_audit};
 use bichon_core::message::list::get_thread_messages;
 use bichon_core::message::search::{search_messages_impl, EmailSearchRequest};
 use bichon_core::message::tags::TagCount;
@@ -67,7 +69,19 @@ impl MessageApi {
         for account_id in request.keys() {
             context.require_permission(Some(*account_id), Permission::DATA_DELETE)?;
         }
-        Ok(delete_messages_impl(request).await?)
+        // Audit: plan the records and capture whatever must be captured before
+        // the messages are gone — inline snapshots, or a detail file for large
+        // batches — so the trail stays self-describing.
+        let user = context.user.username.clone();
+        let plan = plan_delete_audit(&request);
+        let result = delete_messages_impl(request).await;
+        // Emit only on success: a failed delete must not leave "deleted"
+        // records for messages that still exist.
+        if result.is_ok() {
+            emit_delete_audit(plan, &user);
+        }
+        result?;
+        Ok(())
     }
 
     /// Searches messages across all mailboxes using various filter criteria.
@@ -88,7 +102,23 @@ impl MessageApi {
             } else {
                 Some(context.user.account_access_map.keys().cloned().collect())
             };
-        Ok(Json(search_messages_impl(authorized_ids, payload.0)?))
+        let search_text = payload
+            .0
+            .filter
+            .text
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let user = context.user.username.clone();
+        let result = search_messages_impl(authorized_ids, payload.0)?;
+        if !search_text.is_empty() {
+            emit(Event::SearchPerformed {
+                query: search_text,
+                user,
+            });
+        }
+        Ok(Json(result))
     }
 
     /// Retrieves all messages belonging to a specific thread. Requires `thread_id`, `page`, and `page_size` query parameters.
@@ -141,11 +171,22 @@ impl MessageApi {
         let account_id = account_id.0;
         let block_remote = block_remote_content.0.unwrap_or(false);
         context.require_permission(Some(account_id), Permission::DATA_READ)?;
-        Ok(Json(retrieve_email_content(
-            account_id,
-            envelope_id.0,
-            block_remote,
-        )?))
+        let envelope_id = envelope_id.0.trim().to_string();
+        let envelope = ENVELOPE_MANAGER
+            .get_envelope_by_id(account_id, &envelope_id)?
+            .map(|ea| ea.envelope);
+        let content = retrieve_email_content(account_id, envelope_id.clone(), block_remote)?;
+        if let Some(ip) = context.ip_addr {
+            emit(Event::EmailViewed {
+                email_id: envelope_id.clone(),
+                user: context.user.username.clone(),
+                ip,
+                account_id,
+                mailbox_id: envelope.as_ref().map(|e| e.mailbox_id).unwrap_or(0),
+                subject: envelope.as_ref().map(|e| e.subject.clone()),
+            });
+        }
+        Ok(Json(content))
     }
 
     /// Retrieves the content of an email embedded as an attachment.
@@ -225,12 +266,48 @@ impl MessageApi {
         AccountModel::check_account_exists(account_id)?;
         context.require_permission(Some(account_id), Permission::DATA_RAW_DOWNLOAD)?;
         let envelope_id = envelope_id.0;
+        let subject = ENVELOPE_MANAGER
+            .get_envelope_by_id(account_id, &envelope_id)
+            .ok()
+            .flatten()
+            .map(|ea| ea.envelope.subject.clone());
+        emit(Event::EmailExported {
+            email_id: envelope_id.clone(),
+            user: context.user.username.clone(),
+            account_id,
+            subject,
+        });
         let reader = get_reader(account_id, envelope_id.clone()).await?;
         let body = Body::from_async_read(reader);
         let attachment = Attachment::new(body)
             .attachment_type(AttachmentType::Attachment)
             .filename(format!("{envelope_id}.eml"));
         Ok(attachment)
+    }
+
+    /// Re-fetches one archived message from IMAP and restores missing email or
+    /// attachment blobs in place. The envelope and its id are kept, so no
+    /// duplicate is created; nothing is written unless the fetched message
+    /// hashes to the archived content hash.
+    #[oai(
+        path = "/repair-message/:account_id/:envelope_id",
+        method = "post",
+        operation_id = "repair_message"
+    )]
+    async fn repair_message(
+        &self,
+        /// The ID of the account.
+        account_id: Path<u64>,
+        /// The ID of the message to repair.
+        envelope_id: Path<String>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<BlobRepairReport>> {
+        let account_id = account_id.0;
+        AccountModel::check_account_exists(account_id)?;
+        context.require_permission(Some(account_id), Permission::DATA_MANAGE)?;
+        Ok(Json(
+            repair_envelope_blobs(account_id, &envelope_id.0).await?,
+        ))
     }
 
     /// Restore an email to an account's IMAP server.
@@ -248,10 +325,23 @@ impl MessageApi {
     ) -> ApiResult<()> {
         let account_id = account_id.0;
         context.require_permission(Some(account_id), Permission::DATA_EXPORT_BATCH)?;
+        for eid in &payload.0.envelope_ids {
+            let subject = ENVELOPE_MANAGER
+                .get_envelope_by_id(account_id, eid)
+                .ok()
+                .flatten()
+                .map(|ea| ea.envelope.subject.clone());
+            emit(Event::EmailRestored {
+                email_id: eid.clone(),
+                user: context.user.username.clone(),
+                account_id,
+                subject,
+            });
+        }
         Ok(restore_emails(account_id, payload.0.envelope_ids).await?)
     }
 
-    /// Downloads a specific attachment from an email. Requires `name` query parameter.
+    /// Downloads a specific attachment from an email. Requires `content_hash` query parameter.
     #[oai(
         path = "/download-attachment/:account_id/:envelope_id",
         method = "get",
@@ -272,7 +362,19 @@ impl MessageApi {
         AccountModel::check_account_exists(account_id)?;
         context.require_permission(Some(account_id), Permission::DATA_READ)?;
         let content_hash = content_hash.0.trim();
-        let reader = retrieve_attachment_content(account_id, envelope_id, content_hash)?;
+        let meta = attachment_meta_for_audit(account_id, &envelope_id, content_hash);
+        let reader = retrieve_attachment_content(account_id, envelope_id.clone(), content_hash)?;
+        emit(Event::AttachmentDownloaded {
+            email_id: envelope_id.clone(),
+            content_hash: content_hash.to_string(),
+            user: context.user.username.clone(),
+            account_id,
+            mailbox_id: meta.mailbox_id,
+            filename: meta.filename,
+            size: meta.size,
+            ext: meta.ext,
+            parent_content_hash: meta.parent_content_hash,
+        });
         let body = Body::from_async_read(reader);
         let attachment = Attachment::new(body)
             .attachment_type(AttachmentType::Attachment)
@@ -302,7 +404,16 @@ impl MessageApi {
         AccountModel::check_account_exists(account_id)?;
         context.require_permission(Some(account_id), Permission::DATA_READ)?;
         let content_hash = content_hash.0.trim();
-        let reader = retrieve_attachment_content(account_id, envelope_id, content_hash)?;
+        let meta = attachment_meta_for_audit(account_id, &envelope_id, content_hash);
+        let reader = retrieve_attachment_content(account_id, envelope_id.clone(), content_hash)?;
+        emit(Event::AttachmentPreviewed {
+            email_id: envelope_id.clone(),
+            content_hash: content_hash.to_string(),
+            user: context.user.username.clone(),
+            account_id,
+            mailbox_id: meta.mailbox_id,
+            filename: meta.filename,
+        });
         let body = Body::from_async_read(reader);
         Ok(Attachment::new(body).attachment_type(AttachmentType::Inline))
     }
@@ -330,12 +441,24 @@ impl MessageApi {
         context.require_permission(Some(account_id), Permission::DATA_READ)?;
         let content_hash = content_hash.0.trim();
         let nested_content_hash = nested_content_hash.0.trim();
+        let meta = attachment_meta_for_audit(account_id, &envelope_id, content_hash);
         let reader = retrieve_nested_attachment_content(
             account_id,
-            envelope_id,
+            envelope_id.clone(),
             content_hash,
             nested_content_hash,
         )?;
+        emit(Event::AttachmentDownloaded {
+            email_id: envelope_id.clone(),
+            content_hash: nested_content_hash.to_string(),
+            user: context.user.username.clone(),
+            account_id,
+            mailbox_id: meta.mailbox_id,
+            filename: None,
+            size: None,
+            ext: None,
+            parent_content_hash: meta.parent_content_hash,
+        });
         let body = Body::from_async_read(reader);
         let attachment = Attachment::new(body)
             .attachment_type(AttachmentType::Attachment)
@@ -375,6 +498,21 @@ impl MessageApi {
             context.require_permission(Some(*account_id), Permission::DATA_MANAGE)?;
         }
 
+        let total_updates: u64 = req.updates.values().map(|ids| ids.len() as u64).sum();
+        if total_updates > 0 {
+            for account_id in req.updates.keys() {
+                emit(Event::EmailTagged {
+                    user: context.user.username.clone(),
+                    account_id: *account_id,
+                    count: req
+                        .updates
+                        .get(account_id)
+                        .map(|ids| ids.len() as u64)
+                        .unwrap_or(0),
+                });
+            }
+        }
+
         ENVELOPE_MANAGER.update_envelope_tags(req).await?;
         Ok(())
     }
@@ -395,3 +533,60 @@ impl MessageApi {
         Ok(Json(ENVELOPE_MANAGER.get_all_contacts(authorized_ids)?))
     }
 }
+
+/// Attachment metadata captured for the audit trail.
+struct AttachmentAuditMeta {
+    mailbox_id: u64,
+    filename: Option<String>,
+    size: Option<u64>,
+    ext: Option<String>,
+    parent_content_hash: Option<String>,
+}
+
+impl Default for AttachmentAuditMeta {
+    fn default() -> Self {
+        Self {
+            mailbox_id: 0,
+            filename: None,
+            size: None,
+            ext: None,
+            parent_content_hash: None,
+        }
+    }
+}
+
+/// Resolves attachment display metadata (name, size, extension) and the
+/// parent envelope's mailbox/content hash, for the audit trail. Best-effort:
+/// failures degrade to defaults rather than failing the download.
+fn attachment_meta_for_audit(
+    account_id: u64,
+    envelope_id: &str,
+    content_hash: &str,
+) -> AttachmentAuditMeta {
+    let mut meta = AttachmentAuditMeta::default();
+    if let Ok(Some(ea)) = ENVELOPE_MANAGER.get_envelope_by_id(account_id, envelope_id) {
+        meta.mailbox_id = ea.envelope.mailbox_id;
+        meta.parent_content_hash = Some(ea.envelope.content_hash);
+        if let Some(atts) = ea.attachments {
+            for att in atts {
+                if att.content_hash == content_hash {
+                    meta.filename = att.filename.clone();
+                    meta.size = Some(att.size as u64);
+                    meta.ext = att
+                        .filename
+                        .as_ref()
+                        .and_then(|n| std::path::Path::new(n).extension())
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_ascii_lowercase());
+                    break;
+                }
+            }
+        }
+    }
+    meta
+}
+
+// The delete-batch audit helpers used to live here. They moved to
+// `bichon_core::message::delete` when the dual-control executor became a
+// second caller: a handler-private copy would have left the approval path
+// emitting `email.deleted` records with no subject.

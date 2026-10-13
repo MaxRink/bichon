@@ -43,7 +43,7 @@ pub struct AccountCreateRequest {
     pub date_since: Option<DateSince>,
     pub date_before: Option<RelativeDate>,
     pub account_type: AccountType,
-    #[cfg_attr(feature = "web-api", oai(validator(minimum(value = "10"))))]
+    #[cfg_attr(feature = "web-api", oai(validator(minimum(value = "1"))))]
     pub download_interval_min: Option<i64>,
     #[cfg_attr(
         feature = "web-api",
@@ -51,7 +51,6 @@ pub struct AccountCreateRequest {
     )]
     pub download_batch_size: Option<u32>,
     pub max_email_size_bytes: Option<u64>,
-    pub use_proxy: Option<u64>,
     pub use_dangerous: bool,
     pub pgp_key: Option<String>,
     pub imap_quota_bytes: Option<u64>,
@@ -64,6 +63,9 @@ pub struct AccountCreateRequest {
     /// Attachment text extraction rules (Pro feature).
     /// `None` = extract everything (backward compatible).
     pub extraction_rules: Option<ExtractionRules>,
+    /// Account-level retention period in days (free/community feature).
+    /// `None` or `0` = disabled (archive everything, never auto-purge).
+    pub retention_days: Option<u64>,
 }
 
 impl AccountCreateRequest {
@@ -180,7 +182,7 @@ pub struct AccountUpdateRequest {
     /// Modified folders will be automatically synced on the next update.
     pub sync_folders: Option<Vec<String>>,
     /// Incremental download interval (seconds)
-    #[cfg_attr(feature = "web-api", oai(validator(minimum(value = "10"))))]
+    #[cfg_attr(feature = "web-api", oai(validator(minimum(value = "1"))))]
     pub download_interval_min: Option<i64>,
     #[cfg_attr(
         feature = "web-api",
@@ -188,11 +190,6 @@ pub struct AccountUpdateRequest {
     )]
     pub download_batch_size: Option<u32>,
     pub max_email_size_bytes: Option<u64>,
-    /// Optional proxy ID for establishing the connection to external APIs (e.g., Gmail, Outlook).
-    /// - If `None` or not provided, the client will connect directly to the API server.
-    /// - If `Some(proxy_id)`, the client will use the pre-configured proxy with the given ID for API requests.
-    pub use_proxy: Option<u64>,
-
     pub use_dangerous: Option<bool>,
 
     pub pgp_key: Option<String>,
@@ -201,12 +198,25 @@ pub struct AccountUpdateRequest {
     pub auto_download_new_mailboxes: Option<bool>,
     pub download_schedule: Option<String>,
     pub clear_download_schedule: Option<bool>,
+    /// Clear archive filtering rules back to `None` (default behavior).
+    /// Cannot be combined with `archive_rules`.
+    pub clear_archive_rules: Option<bool>,
+    /// Clear attachment extraction rules back to `None` (default behavior).
+    /// Cannot be combined with `extraction_rules`.
+    pub clear_extraction_rules: Option<bool>,
     /// Email archive filtering rules (Pro feature).
     /// `None` = no change. Use `Some(ArchiveRules { .. })` to set.
     pub archive_rules: Option<ArchiveRules>,
     /// Attachment text extraction rules (Pro feature).
     /// `None` = no change. Use `Some(ExtractionRules { .. })` to set.
     pub extraction_rules: Option<ExtractionRules>,
+    /// Account-level retention period in days (free/community feature).
+    /// `Some(0)` disables retention; `None` means no change. A background
+    /// sweep purges envelopes older than the window (held accounts exempt).
+    pub retention_days: Option<u64>,
+    /// Clear retention back to `None` (disabled). Cannot be combined with
+    /// `retention_days`.
+    pub clear_retention_days: Option<bool>,
 }
 
 impl AccountUpdateRequest {
@@ -235,6 +245,24 @@ impl AccountUpdateRequest {
             ));
         }
 
+        if self.clear_archive_rules == Some(true) && self.archive_rules.is_some() {
+            return Err(raise_error!(
+                "clear_archive_rules cannot be combined with archive_rules".into(),
+                ErrorCode::InvalidParameter
+            ));
+        }
+        if self.clear_extraction_rules == Some(true) && self.extraction_rules.is_some() {
+            return Err(raise_error!(
+                "clear_extraction_rules cannot be combined with extraction_rules".into(),
+                ErrorCode::InvalidParameter
+            ));
+        }
+        if self.clear_retention_days == Some(true) && self.retention_days.is_some() {
+            return Err(raise_error!(
+                "clear_retention_days cannot be combined with retention_days".into(),
+                ErrorCode::InvalidParameter
+            ));
+        }
         if let Some(date_since) = self.date_since.as_ref() {
             date_since.validate()?;
         }

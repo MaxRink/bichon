@@ -10,8 +10,8 @@ use bichon_core::{
         migration::{AccountModel, AccountType},
         since::{DateSince, RelativeDate},
     },
+    archive::imap::mailbox::Attribute,
     autoconfig::entity::MailServerConfig,
-    cache::imap::mailbox::Attribute,
     database::batch_insert_impl,
     error::{code::ErrorCode, BichonError, BichonResult},
     raise_error,
@@ -255,7 +255,6 @@ impl From<AccountV3> for AccountModel {
             created_at: value.created_at,
             updated_at: value.updated_at,
             created_by: value.created_by,
-            use_proxy: value.use_proxy,
             use_dangerous: value.use_dangerous,
             pgp_key: value.pgp_key,
             imap_quota_window: None,
@@ -265,6 +264,15 @@ impl From<AccountV3> for AccountModel {
             deleting: false,
             archive_rules: None,
             extraction_rules: None,
+            // Newer fields default to the safe values: migrated accounts never
+            // start auto-purging (retention disabled) and are never on hold.
+            retention_days: None,
+            legal_hold: false,
+            hold_reason: None,
+            hold_placed_by: None,
+            hold_placed_at: None,
+            hold_released_by: None,
+            hold_released_at: None,
         }
     }
 }
@@ -578,6 +586,11 @@ impl From<BichonUserV2> for bichon_core::users::BichonUserV2 {
             language: value.language,
             sso_id: None,
             sso_provider: None,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_recovery_codes: Vec::new(),
+            global_role_expiries: Default::default(),
+            account_role_expiries: Default::default(),
         }
     }
 }
@@ -654,7 +667,7 @@ pub struct MailBox {
     pub uid_validity: Option<u32>,
 }
 
-impl From<MailBox> for bichon_core::cache::imap::mailbox::MailBox {
+impl From<MailBox> for bichon_core::archive::imap::mailbox::MailBox {
     fn from(value: MailBox) -> Self {
         Self {
             id: value.id,
@@ -899,7 +912,7 @@ pub fn migrate_metadata(root_path: &PathBuf) -> Result<(), Box<dyn std::error::E
     migrate_collection!(
         "Mailboxes",
         MailBox,
-        bichon_core::cache::imap::mailbox::MailBox,
+        bichon_core::archive::imap::mailbox::MailBox,
         &envelope_db
     );
 

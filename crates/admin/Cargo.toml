@@ -3,12 +3,23 @@ name = "bichon-admin"
 version.workspace = true
 edition.workspace = true
 
+# The CLI, menus and restore flow live in the library so the Pro build can
+# ship its own `bichon-admin` binary on top of the exact same code.
+[lib]
+name = "bichon_admin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bichon-admin"
+path = "src/main.rs"
 
 [dependencies]
 bichon-core = { path = "../core" }
 tokio.workspace = true
+clap.workspace = true
 dialoguer.workspace = true
 console.workspace = true
+tracing-subscriber.workspace = true
 indicatif.workspace = true
 native_db = "0.8.2"
 native_model = "0.4.20"
@@ -18,3 +29,15 @@ serde_json.workspace = true
 itertools.workspace = true
 snafu.workspace = true
 bichon-memdb.workspace = true
+fjall.workspace = true
+hex.workspace = true
+bichon-blob.workspace = true
+mail-parser.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+tantivy = { version = "0.26.1", features = ["zstd-compression", "quickwit"] }
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

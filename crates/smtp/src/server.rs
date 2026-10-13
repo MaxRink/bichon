@@ -1,4 +1,3 @@
-//
 // Copyright (c) 2025-2026 rustmailer.com (https://rustmailer.com)
 //
 // This file is part of the Bichon Email Archiving Project
@@ -16,37 +15,32 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::io;
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{io, net::SocketAddr, time::Duration};
 
 use base64::{prelude::BASE64_STANDARD, Engine as _};
-use bichon_core::account::migration::AccountType;
-use bichon_core::cache::imap::mailbox::{Attribute, AttributeEnum};
-use bichon_core::common::signal::SIGNAL_MANAGER;
-use bichon_core::envelope::extractor::extract_envelope_from_smtp;
-use bichon_core::error::BichonResult;
-use bichon_core::settings::cli::{SmtpEncryptionMode, SETTINGS};
-use bichon_core::utils::create_hash;
 use bichon_core::{
-    account::migration::AccountModel,
-    cache::imap::mailbox::MailBox,
-    common::auth::ClientContext,
+    account::migration::{AccountModel, AccountType},
+    archive::imap::mailbox::{Attribute, AttributeEnum, MailBox},
+    backup::gate::WRITE_GATE,
+    common::{auth::ClientContext, signal::SIGNAL_MANAGER},
+    envelope::extractor::extract_envelope_from_smtp,
+    error::BichonResult,
+    settings::cli::{EncryptionMode, SETTINGS},
     token::AccessTokenModel,
     users::{permissions::Permission, UserModel},
+    utils::create_hash,
 };
-use tokio::time::timeout;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::broadcast,
+    time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
 
-use crate::stream::BufStream;
-use crate::tls::create_acceptor;
+use crate::{stream::BufStream, tls::create_acceptor};
 
-const MAX_MAIL_SIZE: usize = 50 * 1024 * 1024; //50MB
+const MAX_MAIL_SIZE: usize = 50 * 1024 * 1024; // 50MB
 const SMTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const GLOBAL_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -394,7 +388,6 @@ where
                 .await?;
         } else {
             let addr = extract_address(&trimmed[8..]);
-            //println!("DEBUG: SMTP RCPT TO extracted address -> '{}'", addr);
             let account_result = AccountModel::find_by_email(addr.as_str());
 
             match account_result {
@@ -619,6 +612,17 @@ async fn read_data<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> io::Result<Vec
 }
 
 async fn parse_email(data: &[u8], session: &Session) -> BichonResult<()> {
+    // During a backup window the write gate is closed. Reject immediately with
+    // a transient error (mapped to "451 try again later" by the caller) so the
+    // client retries after the window instead of blocking on the extractor
+    // gate for up to the acquire timeout.
+    if WRITE_GATE.is_paused() {
+        return Err(bichon_core::raise_error!(
+            "server is currently backing up, mail delivery temporarily unavailable".to_string(),
+            bichon_core::error::code::ErrorCode::TooManyRequest
+        ));
+    }
+
     let rcpt = match session.rcpt_to.first() {
         Some(r) => r,
         None => {
@@ -666,6 +670,7 @@ async fn parse_email(data: &[u8], session: &Session) -> BichonResult<()> {
 
     extract_envelope_from_smtp(data, rcpt.id, mailbox_id)
         .await
+        .map(|_| ())
         .map_err(|e| {
             tracing::error!(
                 "SMTP: Envelope extraction failed for {}: {:?}",
@@ -698,8 +703,8 @@ pub async fn start_smtp_server() -> std::io::Result<SmtpServer> {
     let smtp_port = SETTINGS.bichon_smtp_port;
 
     let tls_acceptor: Option<TlsAcceptor> = match SETTINGS.bichon_smtp_encryption {
-        SmtpEncryptionMode::None => None,
-        SmtpEncryptionMode::Starttls | SmtpEncryptionMode::Tls => Some(create_acceptor().await?),
+        EncryptionMode::None => None,
+        EncryptionMode::Starttls | EncryptionMode::Tls => Some(create_acceptor().await?),
     };
 
     let smtp_listener = TcpListener::bind((
@@ -721,15 +726,15 @@ pub async fn start_smtp_server() -> std::io::Result<SmtpServer> {
     let smtp_config = SmtpConfig {
         whitelist: None,
         tls_acceptor: match SETTINGS.bichon_smtp_encryption {
-            SmtpEncryptionMode::None | SmtpEncryptionMode::Tls => None,
-            SmtpEncryptionMode::Starttls => tls_acceptor.clone(),
+            EncryptionMode::None | EncryptionMode::Tls => None,
+            EncryptionMode::Starttls => tls_acceptor.clone(),
         },
         auth_required: SETTINGS.bichon_smtp_auth_required,
     };
 
     let smtp_shutdown = SIGNAL_MANAGER.subscribe();
 
-    let smtp_handle = if matches!(SETTINGS.bichon_smtp_encryption, SmtpEncryptionMode::Tls) {
+    let smtp_handle = if matches!(SETTINGS.bichon_smtp_encryption, EncryptionMode::Tls) {
         let acceptor = tls_acceptor
             .clone()
             .expect("TLS acceptor required when tls=true");

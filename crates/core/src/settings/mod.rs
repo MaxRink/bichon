@@ -61,10 +61,6 @@ pub struct SystemConfigurations {
     pub bichon_smtp_tls_key_path: Option<String>,
     pub bichon_smtp_tls_cert_path: Option<String>,
 
-    pub bichon_oidc_enabled: bool,
-    pub bichon_oidc_issuer_url: Option<String>,
-    pub bichon_oidc_client_id: Option<String>,
-    pub bichon_oidc_redirect_uri: Option<String>,
 
     pub bichon_upload_body_limit_mb: u64,
 
@@ -92,7 +88,7 @@ impl From<&Settings> for SystemConfigurations {
             bichon_encrypt_password_set: s.bichon_encrypt_password.is_some()
                 || s.bichon_encrypt_password_file.is_some(),
             bichon_webui_token_expiration_hours: s.bichon_webui_token_expiration_hours,
-            bichon_root_dir: s.bichon_root_dir.clone(),
+            bichon_root_dir: s.root_dir().to_string(),
             bichon_enable_rest_https: s.bichon_enable_rest_https,
             bichon_http_compression_enabled: s.bichon_http_compression_enabled,
             bichon_sync_concurrency: s.bichon_sync_concurrency,
@@ -103,12 +99,8 @@ impl From<&Settings> for SystemConfigurations {
             bichon_smtp_port: s.bichon_smtp_port,
             bichon_smtp_encryption: s.bichon_smtp_encryption.to_string(),
             bichon_smtp_auth_required: s.bichon_smtp_auth_required,
-            bichon_smtp_tls_key_path: s.bichon_smtp_tls_key_path.clone(),
-            bichon_smtp_tls_cert_path: s.bichon_smtp_tls_cert_path.clone(),
-            bichon_oidc_enabled: s.bichon_oidc_enabled,
-            bichon_oidc_issuer_url: s.bichon_oidc_issuer_url.clone(),
-            bichon_oidc_client_id: s.bichon_oidc_client_id.clone(),
-            bichon_oidc_redirect_uri: s.bichon_oidc_redirect_uri.clone(),
+            bichon_smtp_tls_key_path: s.bichon_tls_key_path.clone(),
+            bichon_smtp_tls_cert_path: s.bichon_tls_cert_path.clone(),
             bichon_upload_body_limit_mb: s.bichon_upload_body_limit_mb,
             bichon_web_mbox_upload_limit_mb: s.bichon_web_mbox_upload_limit_mb,
             bichon_web_pst_upload_limit_mb: s.bichon_web_pst_upload_limit_mb,

@@ -42,6 +42,7 @@ export enum DownloadStatus {
 export enum TriggerType {
     Manual = "Manual",
     Scheduled = "Scheduled",
+    SyncFull = "SyncFull",
 }
 
 export enum FolderStatus {
@@ -64,6 +65,35 @@ export interface FolderProgress {
 export interface AccountError {
     at: number;
     error: string;
+}
+
+export interface GapFillFolderStats {
+    downloaded: number;
+    failed: number;
+    candidate_count: number;
+    message?: string | null;
+}
+
+export enum GapFillStatus {
+    Running = "Running",
+    Success = "Success",
+    Failed = "Failed",
+    Cancelled = "Cancelled",
+}
+
+export interface GapFillRun {
+    started_at: number;
+    finished_at: number | null;
+    status: GapFillStatus;
+    folders: Record<string, GapFillFolderStats>;
+    downloaded: number;
+    failed: number;
+}
+
+export interface GapFillState {
+    account_id: number;
+    active: GapFillRun | null;
+    history: GapFillRun[];
 }
 
 export interface DownloadSession {
@@ -132,6 +162,14 @@ export interface ArchiveRules {
     spam_headers: string[];
 }
 
+export interface ExtractionRules {
+    enabled: boolean;
+    extensions: FilterRule;
+    folders: FilterRule;
+    attachment_names: FilterRule;
+    senders: FilterRule;
+}
+
 export interface AccountModel {
     id: number;
     account_type: AccountType;
@@ -152,7 +190,6 @@ export interface AccountModel {
     created_user_email: string;
     created_at: number;
     updated_at: number;
-    use_proxy?: number;
     use_dangerous: boolean;
     pgp_key?: string;
     imap_quota_window?: QuotaWindow;
@@ -160,11 +197,24 @@ export interface AccountModel {
     auto_download_new_mailboxes?: boolean;
     download_schedule?: string;
     archive_rules?: ArchiveRules;
+    extraction_rules?: ExtractionRules;
     deleting?: boolean;
+    /** Retention window in days (0 / undefined = keep everything). */
+    retention_days?: number;
+    /** Legal hold flag (Enterprise). When true the retention sweep skips this account. */
+    legal_hold?: boolean;
+    hold_reason?: string | null;
+    hold_placed_by?: number | null;
+    hold_placed_at?: number | null;
 }
 
 export const download_state = async (account_id: number) => {
     const response = await axiosInstance.get<DownloadState>(`api/v1/accounts/${account_id}/download-stats`);
+    return response.data;
+};
+
+export const gap_fill_state = async (account_id: number) => {
+    const response = await axiosInstance.get<GapFillState>(`api/v1/accounts/${account_id}/gap-fill-stats`);
     return response.data;
 };
 
@@ -189,8 +239,8 @@ export const remove_account = async (account_id: number) => {
 };
 
 
-export const start_account_download = async (account_id: number) => {
-    const response = await axiosInstance.post(`api/v1/accounts/${account_id}/start-download`);
+export const start_account_download = async (account_id: number, run_gap_fill = false) => {
+    const response = await axiosInstance.post(`api/v1/accounts/${account_id}/start-download`, { run_gap_fill });
     return response.data;
 };
 

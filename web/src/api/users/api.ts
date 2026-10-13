@@ -31,8 +31,11 @@ export interface UserRole {
     updated_at: number;
 }
 
-export function getPermissions(t: (key: string) => string) {
-    return [
+export function getPermissions(
+    t: (key: string) => string,
+    opts?: { isEnterprise?: boolean }
+) {
+    const list = [
         // 1. Global Management
         { label: t('permission.system.access'), value: 'system:access' },
         { label: t('permission.system.root'), value: 'system:root' },
@@ -60,6 +63,18 @@ export function getPermissions(t: (key: string) => string) {
         { label: t('permission.data.import_batch'), value: 'data:import:batch' },
         { label: t('permission.data.smtp_ingest'), value: 'data:smtp:ingest' },
     ]
+
+    // 4. Compliance suite (Enterprise only — inert permissions otherwise)
+    if (opts?.isEnterprise) {
+        list.push(
+            { label: t('permission.legal.hold'), value: 'legal:hold' },
+            { label: t('permission.timestamp.manage'), value: 'timestamp:manage' },
+            { label: t('permission.compliance.audit'), value: 'compliance:audit' },
+            { label: t('permission.approval.decide'), value: 'approval:decide' },
+        )
+    }
+
+    return list
 }
 
 export interface RateLimit {
@@ -95,6 +110,12 @@ export interface User {
     description?: string | null;
     global_roles: number[];
     global_roles_names: string[];
+    /** Deadline (unix ms) per role id for time-limited delegations. A role
+     *  absent from this map is permanent. The server omits the key entirely
+     *  when there are no delegations, so it may be undefined. */
+    global_role_expiries?: Record<number, number>;
+    /** Deadline (unix ms) per account id, for scoped delegations. */
+    account_role_expiries?: Record<number, number>;
     avatar?: string;
     acl?: AccessControl;
     account_access_map: Record<number, number>;
@@ -103,6 +124,8 @@ export interface User {
     account_permissions: Record<number, string[]>
     created_at: number;
     updated_at: number;
+    sso_id?: string | null;
+    sso_provider?: string | null;
 }
 
 type Theme = 'dark' | 'light'
@@ -114,6 +137,8 @@ export interface LoginResult {
     access_token?: string | null;
     theme?: Theme,
     language?: string,
+    mfa_required?: boolean,
+    mfa_challenge?: string | null,
 }
 
 
@@ -127,6 +152,54 @@ export interface MinimalUser {
 export const login = async (data: Record<string, any>) => {
     const response = await axiosInstance.post<LoginResult>(`api/login`, data);
     return response.data;
+};
+
+// Enterprise: synchronous LDAP/AD bind. Returns the same LoginResult shape as
+// `login`, so the form reuses its existing token + MFA handling unchanged.
+export const ldapLogin = async (data: { username: string; password: string }) => {
+    const response = await axiosInstance.post<LoginResult>(`api/auth/ldap/login`, data);
+    return response.data;
+};
+
+export interface MfaStatus {
+    enabled: boolean;
+    has_secret: boolean;
+}
+
+export interface MfaEnrollResult {
+    secret: string;
+    otpauth_uri: string;
+}
+
+export interface MfaConfirmResult {
+    recovery_codes: string[];
+}
+
+export const mfaVerify = async (challenge: string, code: string) => {
+    const response = await axiosInstance.post<LoginResult>(`api/auth/mfa/verify`, { challenge, code });
+    return response.data;
+};
+
+export const mfaStatus = async () => {
+    const response = await axiosInstance.get<MfaStatus>(`api/v1/mfa/status`);
+    return response.data;
+};
+
+export const mfaEnroll = async () => {
+    const response = await axiosInstance.post<MfaEnrollResult>(`api/v1/mfa/enroll`);
+    return response.data;
+};
+
+export const mfaConfirm = async (code: string) => {
+    const response = await axiosInstance.post<MfaConfirmResult>(`api/v1/mfa/confirm`, { code });
+    return response.data;
+};
+
+export const mfaDisable = async (code: string) => {
+    await axiosInstance.post(`api/v1/mfa/disable`, { code });
+};
+export const mfaAdminReset = async (userId: number) => {
+    await axiosInstance.post(`api/v1/mfa/admin-reset/${userId}`);
 };
 
 export const reset_admin_token = async () => {
@@ -229,4 +302,58 @@ export const get_user_tokens = async (id: number) => {
 export const get_current_user = async () => {
     const response = await axiosInstance.get<User>("api/v1/current-user");
     return response.data;
+};
+
+// ── Time-limited role delegation (Enterprise) ──────────────────────
+//
+// The deadline lives on the *assignment*, not the role, so these calls take a
+// role id that the user must already hold. Assigning a role stays on
+// `update_user`; this only puts an end date on an assignment that exists.
+
+/** One delegation. `expired` is computed server-side so the UI never has to
+ *  re-derive the comparison and disagree with the enforcement path. */
+export interface Delegation {
+    scope: 'global' | 'account';
+    role_id?: number | null;
+    account_id?: number | null;
+    role_name?: string | null;
+    /** Unix ms. */
+    expires_at: number;
+    /** Negative once lapsed. */
+    remaining_ms: number;
+    expired: boolean;
+}
+
+export const list_delegations = async (userId: number): Promise<Delegation[]> => {
+    const response = await axiosInstance.get<{ delegations: Delegation[] }>(
+        `api/v1/users/${userId}/delegations`
+    );
+    return response.data.delegations;
+};
+
+/**
+ * Put an end date on a role assignment the user already holds.
+ *
+ * Sends `expires_at` (unix ms) so the deadline is the calendar instant that
+ * was approved, not "N days from whenever this request landed". `days` is the
+ * convenience path and is converted server-side.
+ */
+export const delegate_role = async (
+    userId: number,
+    roleId: number,
+    deadline: { expires_at: number } | { days: number }
+): Promise<Delegation> => {
+    const response = await axiosInstance.put<{ delegation: Delegation }>(
+        `api/v1/users/${userId}/delegations`,
+        { role_id: roleId, ...deadline }
+    );
+    return response.data.delegation;
+};
+
+/** Remove the end date, leaving the role assigned permanently. */
+export const undelegate_role = async (
+    userId: number,
+    roleId: number
+): Promise<void> => {
+    await axiosInstance.delete(`api/v1/users/${userId}/delegations/${roleId}`);
 };

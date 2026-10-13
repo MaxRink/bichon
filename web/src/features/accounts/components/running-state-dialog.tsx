@@ -26,7 +26,8 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useQuery } from '@tanstack/react-query'
-import { download_state, AccountModel, FolderProgress } from '@/api/account/api'
+import { useEffect, useState } from 'react'
+import { download_state, gap_fill_state, DownloadStatus, AccountModel, FolderProgress, GapFillRun, GapFillStatus } from '@/api/account/api'
 import { format } from 'date-fns'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Badge } from '@/components/ui/badge'
@@ -114,15 +115,79 @@ function FolderDetailItem({ f, t }: { f: FolderProgress, t: (key: string) => str
 
       {f.message && (
         <div className="px-4 pb-4">
-          <div className="bg-muted/50 border rounded-lg p-3 flex gap-3 items-start">
-            <Info className="w-4 h-4 text-muted-foreground mt-0.5 shrink-0" />
+          <div className={`border rounded-lg p-3 flex gap-3 items-start ${f.message.toLowerCase().includes('slow') || f.message.toLowerCase().includes('limiting')
+            ? 'bg-amber-500/10 border-amber-500/30'
+            : 'bg-muted/50'}`}>
+            {f.message.toLowerCase().includes('slow') || f.message.toLowerCase().includes('limiting') ? (
+              <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+            ) : (
+              <Info className="w-4 h-4 text-muted-foreground mt-0.5 shrink-0" />
+            )}
             <div className="space-y-0.5">
               <p className="text-[10px] font-bold text-foreground">{t('accounts.runningState.message')}:</p>
-              <p className="text-[10px] font-medium text-muted-foreground leading-relaxed">{f.message}</p>
+              <p className={`text-[10px] font-medium leading-relaxed ${f.message.toLowerCase().includes('slow') || f.message.toLowerCase().includes('limiting')
+                ? 'text-amber-700'
+                : 'text-muted-foreground'}`}>{f.message}</p>
             </div>
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+function GapFillRunDetail({ run, t }: { run: GapFillRun, t: (key: string) => string }) {
+  const folderEntries = Object.entries(run.folders)
+  if (folderEntries.length === 0) {
+    return (
+      <div className="text-center py-8 text-muted-foreground italic text-xs">
+        {t('accounts.runningState.empty.no_gap_fill_folders')}
+      </div>
+    )
+  }
+  const isActive = run.status === GapFillStatus.Running
+  return (
+    <div className="space-y-3">
+      {folderEntries.map(([name, stats]) => {
+        const pct = stats.candidate_count > 0
+          ? Math.min(100, Math.round((stats.downloaded / stats.candidate_count) * 100))
+          : 0
+        return (
+          <div key={name} className="py-1.5 border-b border-border/50 last:border-b-0">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-bold text-foreground truncate">{name}</span>
+              <span className="text-[10px] font-bold text-muted-foreground whitespace-nowrap">
+                {isActive && stats.candidate_count > 0 ? (
+                  <span className="text-blue-600">
+                    {stats.downloaded} <span className="opacity-50">/</span> {stats.candidate_count}
+                  </span>
+                ) : (
+                  <>
+                    <span className="text-blue-600">{stats.downloaded} {t('accounts.runningState.gap_fill_downloaded_suffix')}</span>
+                    {stats.failed > 0 && (
+                      <>
+                        <span className="mx-1 opacity-30">·</span>
+                        <span className="text-destructive">{stats.failed} {t('accounts.runningState.gap_fill_failed_suffix')}</span>
+                      </>
+                    )}
+                  </>
+                )}
+              </span>
+            </div>
+            {isActive && stats.candidate_count > 0 && (
+              <div className="mt-1.5 h-1.5 w-full rounded-full bg-muted overflow-hidden">
+                <div className="h-full rounded-full bg-blue-500 transition-all duration-500" style={{ width: `${pct}%` }} />
+              </div>
+            )}
+            {stats.message && (
+              <div className="mt-1.5 flex items-start gap-1.5">
+                <AlertTriangle className="w-3 h-3 text-amber-600 mt-0.5 shrink-0" />
+                <p className="text-[10px] font-medium text-amber-700 leading-relaxed">{stats.message}</p>
+              </div>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -133,12 +198,47 @@ export function RunningStateDialog({ currentRow, open, onOpenChange }: Props) {
   const { data: state, isLoading } = useQuery({
     queryKey: ['running-state', currentRow.id],
     queryFn: () => download_state(currentRow.id),
-    refetchInterval: 5000,
+    refetchInterval: (query) => {
+      const s = query.state.data?.active_session
+      return s && s.status === DownloadStatus.Running ? 5000 : false
+    },
+    enabled: open && !!currentRow.id,
+  })
+
+  const { data: gapFillData } = useQuery({
+    queryKey: ['gap-fill-state', currentRow.id],
+    queryFn: () => gap_fill_state(currentRow.id),
+    refetchInterval: (query) => {
+      const a = query.state.data?.active
+      return a && a.status === GapFillStatus.Running ? 5000 : false
+    },
     enabled: open && !!currentRow.id,
   })
 
   const session = state?.active_session
   const history = state?.history || []
+  const isRunning = !!session && session.status === DownloadStatus.Running
+
+  // When the poll is active, tick once per second so the "elapsed" and
+  // "last updated Xs ago" readouts stay fresh between refetches.
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    if (!isRunning) return
+    const id = setInterval(() => setTick((v) => v + 1), 1000)
+    return () => clearInterval(id)
+  }, [isRunning])
+
+  const elapsedSec = session && isRunning
+    ? Math.max(0, Math.floor((Date.now() - new Date(session.start_time).getTime()) / 1000))
+    : 0
+  const formatDur = (s: number) => {
+    const h = Math.floor(s / 3600)
+    const m = Math.floor((s % 3600) / 60)
+    const sec = s % 60
+    if (h > 0) return `${h}h ${m}m ${sec}s`
+    if (m > 0) return `${m}m ${sec}s`
+    return `${sec}s`
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -164,6 +264,10 @@ export function RunningStateDialog({ currentRow, open, onOpenChange }: Props) {
               <TabsTrigger value="history" className="whitespace-nowrap data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none h-full bg-transparent shadow-none px-0 text-xs sm:text-sm font-bold">
                 {t('accounts.runningState.tabs.history')}
                 <Badge variant="secondary" className="ml-2 h-4 px-1 text-[10px] font-bold">{history.length}</Badge>
+              </TabsTrigger>
+              <TabsTrigger value="gapfill" className="whitespace-nowrap data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none h-full bg-transparent shadow-none px-0 text-xs sm:text-sm font-bold">
+                {t('accounts.runningState.tabs.gap_fill')}
+                {gapFillData?.active && <Badge variant="secondary" className="ml-2 h-4 px-1 text-[10px] font-bold animate-pulse">{t('accounts.runningState.syncing')}</Badge>}
               </TabsTrigger>
             </TabsList>
           </div>
@@ -202,6 +306,23 @@ export function RunningStateDialog({ currentRow, open, onOpenChange }: Props) {
                               </div>
                             </div>
                           </div>
+                          {isRunning && (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              <div className="p-3 sm:p-4 rounded-xl border bg-card shadow-sm flex items-center justify-between sm:block">
+                                <p className="text-[10px] font-bold text-muted-foreground uppercase mb-1">{t('accounts.runningState.session.elapsed')}</p>
+                                <div className="text-sm font-bold font-mono text-blue-600 flex items-center gap-1.5">
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  {formatDur(elapsedSec)}
+                                </div>
+                              </div>
+                              {session.current_folder && (
+                                <div className="p-3 sm:p-4 rounded-xl border bg-card shadow-sm flex items-center justify-between sm:block">
+                                  <p className="text-[10px] font-bold text-muted-foreground uppercase mb-1">{t('accounts.runningState.session.current_folder')}</p>
+                                  <div className="text-sm font-bold text-foreground truncate">{session.current_folder}</div>
+                                </div>
+                              )}
+                            </div>
+                          )}
                           <Tabs defaultValue="folders" className="w-full">
                             <TabsList className="bg-muted mb-3 h-8">
                               <TabsTrigger value="folders" className="text-[11px] font-bold">
@@ -380,6 +501,55 @@ export function RunningStateDialog({ currentRow, open, onOpenChange }: Props) {
                                     )}
                                   </TabsContent>
                                 </Tabs>
+                              </AccordionContent>
+                            </AccordionItem>
+                          ))}
+                        </Accordion>
+                      )}
+                    </div>
+                  </ScrollArea>
+                </TabsContent>
+                <TabsContent value="gapfill" className="h-full m-0 data-[state=active]:flex flex-col">
+                  <ScrollArea className="flex-1">
+                    <div className="p-4 sm:p-6 space-y-4">
+                      {gapFillData?.active && (
+                        <div className="rounded-xl border bg-card shadow-sm p-4">
+                          <div className="flex items-center justify-between mb-3">
+                            <p className="text-[10px] font-bold text-muted-foreground uppercase">{t('accounts.runningState.gap_fill_active')}</p>
+                            <StatusBadge status={gapFillData.active.status} />
+                          </div>
+                          <GapFillRunDetail run={gapFillData.active} t={t} />
+                        </div>
+                      )}
+                      {(!gapFillData?.history || gapFillData.history.length === 0) ? (
+                        <div className="text-center py-20 text-muted-foreground italic text-sm">
+                          {t('accounts.runningState.empty.no_gap_fill_history')}
+                        </div>
+                      ) : (
+                        <Accordion type="single" collapsible className="space-y-3">
+                          {[...gapFillData.history].reverse().map((run, i) => (
+                            <AccordionItem key={i} value={`gapfill-${i}`} className="border rounded-xl bg-card shadow-sm px-4 border-border overflow-hidden">
+                              <AccordionTrigger className="hover:no-underline py-4">
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between w-full pr-4 gap-2">
+                                  <div className="flex items-center gap-3">
+                                    <div className="text-xs sm:text-xs font-bold font-mono text-foreground">
+                                      {format(new Date(run.started_at), 'yyyy-MM-dd HH:mm:ss')}
+                                    </div>
+                                    <StatusBadge status={run.status} />
+                                  </div>
+                                  <span className="text-[10px] font-bold text-muted-foreground bg-muted px-2 py-0.5 rounded-full self-start sm:self-auto">
+                                    <span className="text-blue-600">{run.downloaded} {t('accounts.runningState.gap_fill_downloaded_suffix')}</span>
+                                    {run.failed > 0 && (
+                                      <>
+                                        <span className="mx-1 opacity-30">·</span>
+                                        <span className="text-destructive">{run.failed} {t('accounts.runningState.gap_fill_failed_suffix')}</span>
+                                      </>
+                                    )}
+                                  </span>
+                                </div>
+                              </AccordionTrigger>
+                              <AccordionContent className="pb-4 border-t pt-4 mt-1 border-border">
+                                <GapFillRunDetail run={run} t={t} />
                               </AccordionContent>
                             </AccordionItem>
                           ))}

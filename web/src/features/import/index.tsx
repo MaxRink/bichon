@@ -9,7 +9,7 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import {
   Upload, FileText, X, CheckCircle2, AlertTriangle,
   Sparkles, PenLine, ListTree, ChevronsUpDown, Check,
-  Clock, ChevronRight,
+  Clock, ChevronRight, Copy,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -45,6 +45,7 @@ import {
 import { get_system_configurations } from '@/api/system/api';
 import { list_mailboxes } from '@/api/mailbox/api';
 import { extractFolderHint, type FolderHint } from './folder-hint';
+import { importFiles, errorMessage } from './import-files';
 
 const MAX_EML = 100 * 1024 * 1024;   // 100 MB (hardcoded)
 const DEFAULT_MAX_MBOX = 1024 * 1024 * 1024; // 1 GB (fallback; actual limit from server settings)
@@ -101,10 +102,9 @@ export default function ImportPage() {
 
   const [accountId, setAccountId] = useState<string>('');
   const [folderMode, setFolderMode] = useState<FolderMode>('');
-  const [folder, setFolder] = useState('INBOX');
+  const [folder, setFolder] = useState('inbox');
   const [files, setFiles] = useState<QueuedFile[]>([]);
   const [dragging, setDragging] = useState(false);
-  // const [importId, setImportId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [uploadPct, setUploadPct] = useState(0);
   const [phase, setPhase] = useState<'idle' | 'uploading' | 'processing' | 'done'>('idle');
@@ -117,7 +117,14 @@ export default function ImportPage() {
   // Combobox state for account selection
   const [accountOpen, setAccountOpen] = useState(false);
 
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const processedCount = progress ? progress.success + progress.failed + progress.duplicates : 0;
+  const processedPct = progress && progress.total > 0 ? (processedCount / progress.total) * 100 : 0;
+
+  useEffect(() => {
+    return () => { abortRef.current?.abort(); };
+  }, []);
 
   const { data: accounts = [] } = useQuery({
     queryKey: ['nosync-accounts'],
@@ -168,33 +175,6 @@ export default function ImportPage() {
     }
   })();
 
-  const startPolling = useCallback((id: string) => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    let retries = 0;
-    pollRef.current = setInterval(async () => {
-      try {
-        const p = await get_import_progress(id);
-        setProgress(p);
-        retries = 0;
-        if (p.status === 'Completed' || p.status === 'Failed') {
-          if (pollRef.current) clearInterval(pollRef.current);
-          setPhase('done');
-          refetchHistory();
-        }
-      } catch {
-        retries++;
-        if (retries > 5) {
-          if (pollRef.current) clearInterval(pollRef.current);
-          setPhase('idle');
-        }
-      }
-    }, 1000);
-  }, [refetchHistory]);
-
-  useEffect(() => {
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, []);
-
   const handleFiles = useCallback(async (newFiles: FileList | File[]) => {
     const arr = Array.from(newFiles) as File[];
     const queued: QueuedFile[] = arr.map((f) => {
@@ -209,7 +189,6 @@ export default function ImportPage() {
     setFiles(queued);
     setPhase('idle');
     setProgress(null);
-    //setImportId(null);
 
     // Extract folder hint from the first valid file.
     // PST files are binary (OLE2) — headers can't be extracted in-browser.
@@ -277,26 +256,32 @@ export default function ImportPage() {
   const importMutation = useMutation({
     mutationFn: async () => {
       if (!accountId || !files.length) return;
-      const file = files[0].file;
+      const controller = new AbortController();
+      abortRef.current = controller;
       setPhase('uploading');
       setUploadPct(0);
-      const result = await upload_import(
-        Number(accountId),
-        effectiveFolder,
-        file.name,
-        file,
-        (pct) => setUploadPct(pct),
+      setProgress(null);
+      await importFiles(
+        files.map((q) => q.file),
+        {
+          upload: (file, onPct) =>
+            upload_import(Number(accountId), effectiveFolder, file.name, file, onPct),
+          getProgress: get_import_progress,
+          onUploadPct: setUploadPct,
+          onProgress: setProgress,
+          onPhase: setPhase,
+          signal: controller.signal,
+        },
       );
-      //setImportId(result.import_id);
-      setProgress(result);
-      setPhase('processing');
-      startPolling(result.import_id);
+      setPhase('done');
+      refetchHistory();
     },
-    onError: (err: any) => {
+    onError: (err: unknown) => {
       setPhase('idle');
+      setProgress(null);
       toast({
         title: t('common.failed'),
-        description: err?.response?.data?.message || err.message,
+        description: errorMessage(err),
         variant: 'destructive',
       });
     },
@@ -311,10 +296,10 @@ export default function ImportPage() {
       <Main>
         <div className="flex-1 space-y-6 p-6 md:p-8 max-w-3xl mx-auto">
           <div>
-            <h1 className="text-xl font-bold tracking-tight">
+            <h1 className="text-lg font-bold tracking-tight">
               {t('import.title', 'Import EML / MBOX / PST')}
             </h1>
-            <p className="text-sm text-muted-foreground mt-1">
+            <p className="text-xs text-muted-foreground mt-1">
               {t('import.description', 'Import email files into a NoSync account. For larger files, use the CLI.')}
             </p>
           </div>
@@ -381,196 +366,20 @@ export default function ImportPage() {
                     </Command>
                   </PopoverContent>
                 </Popover>
+                {!accountId && (
+                  <p className="text-xs text-destructive mt-1.5 flex items-center gap-1">
+                    <AlertTriangle className="h-3 w-3" />
+                    {t('import.selectAccountRequired', 'Please select a target account before importing.')}
+                  </p>
+                )}
               </div>
             </CardContent>
           </Card>
-
-          {/* Step 2: Folder determination mode */}
+          {/* Step 2: File upload */}
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium">
-                {isPstSelected
-                  ? t('import.folderStructure', '2. Folder structure')
-                  : t('import.folderMethod', '2. Choose folder method')}
-              </CardTitle>
-              <CardDescription className="text-xs">
-                {isPstSelected
-                  ? t('import.pstFolderDesc', 'The PST file contains its own folder structure (e.g. Inbox, Sent Items, etc.). Folders will be automatically created during import.')
-                  : files.length === 0
-                    ? t('import.selectFileFirst', 'Select a file first to determine available options.')
-                    : t('import.folderMethodDesc', 'How should the target mail folder be determined?')}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {!isPstSelected && (
-              <RadioGroup
-                value={folderMode}
-                onValueChange={(v) => handleModeChange(v as FolderMode)}
-                className="gap-3"
-              >
-                {/* Mode 1: Auto-detect from headers */}
-                <label
-                  className={cn(
-                    'flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors',
-                    folderMode === 'header'
-                      ? 'border-primary bg-primary/5'
-                      : 'border-border hover:bg-muted/50',
-                  )}
-                >
-                  <RadioGroupItem value="header" id="mode-header" className="mt-0.5" />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <Sparkles className="h-4 w-4 text-primary" />
-                      <span className="text-sm font-medium">
-                        {t('import.modeHeader', 'Auto-detect from email headers')}
-                      </span>
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t('import.modeHeaderDesc', 'Read X-Gmail-Labels / X-Bichon-Metadata from the uploaded file. Falls back to filename.')}
-                    </p>
-                    {folderMode === 'header' && (
-                      <div className="mt-2 flex items-center gap-2">
-                        <Badge variant="secondary" className="text-xs font-normal">
-                          {folderHint
-                            ? t('import.detectedFolder', 'Detected') + ': ' + headerFolder
-                            : t('import.noFileYet', 'No file selected yet')}
-                        </Badge>
-                        {folderHint && (
-                          <span className="text-[10px] text-muted-foreground">
-                            ({t('import.source')}: {folderHintLabel(folderHint)})
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </label>
-
-                {/* Mode 2: Pick from existing mailboxes */}
-                <label
-                  className={cn(
-                    'flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors',
-                    folderMode === 'existing'
-                      ? 'border-primary bg-primary/5'
-                      : 'border-border hover:bg-muted/50',
-                    !accountId && 'opacity-50 pointer-events-none',
-                  )}
-                >
-                  <RadioGroupItem value="existing" id="mode-existing" className="mt-0.5" disabled={!accountId} />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <ListTree className="h-4 w-4 text-primary" />
-                      <span className="text-sm font-medium">
-                        {t('import.modeExisting', 'Choose from existing mailboxes')}
-                      </span>
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t('import.modeExistingDesc', 'Select one of the mailboxes already present in this account.')}
-                    </p>
-                    {folderMode === 'existing' && (
-                      <div className="mt-2">
-                        {mailboxes.length === 0 ? (
-                          <span className="text-xs text-muted-foreground">
-                            {accountId
-                              ? t('import.noMailboxes', 'No mailboxes found in this account.')
-                              : t('import.selectAccountFirst', 'Select an account first.')}
-                          </span>
-                        ) : (
-                          <Popover open={mailboxOpen} onOpenChange={setMailboxOpen}>
-                            <PopoverTrigger asChild>
-                              <Button
-                                variant="outline"
-                                role="combobox"
-                                className="h-8 justify-between text-xs max-w-xs w-full"
-                              >
-                                <span className="truncate">
-                                  {folder || t('import.selectMailbox', 'Select a mailbox...')}
-                                </span>
-                                <ChevronsUpDown className="ml-2 h-3.5 w-3.5 shrink-0 opacity-50" />
-                              </Button>
-                            </PopoverTrigger>
-                            <PopoverContent className="w-[280px] p-0" align="start">
-                              <Command>
-                                <CommandInput
-                                  placeholder={t('import.searchMailbox', 'Search mailboxes...')}
-                                  className="h-9 text-xs"
-                                />
-                                <CommandList>
-                                  <CommandEmpty>
-                                    {t('import.noMailboxFound', 'No mailbox found.')}
-                                  </CommandEmpty>
-                                  <CommandGroup>
-                                    {mailboxes.map((mb) => (
-                                      <CommandItem
-                                        key={mb.id}
-                                        value={mb.name}
-                                        onSelect={(value) => {
-                                          setFolder(value);
-                                          setMailboxOpen(false);
-                                        }}
-                                        className='text-xs'
-                                      >
-                                        <Check
-                                          className={cn(
-                                            'h-4 w-4',
-                                            folder === mb.name ? 'opacity-100' : 'opacity-0',
-                                          )}
-                                        />
-                                        {mb.name}
-                                      </CommandItem>
-                                    ))}
-                                  </CommandGroup>
-                                </CommandList>
-                              </Command>
-                            </PopoverContent>
-                          </Popover>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </label>
-
-                {/* Mode 3: Manual input */}
-                <label
-                  className={cn(
-                    'flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors',
-                    folderMode === 'custom'
-                      ? 'border-primary bg-primary/5'
-                      : 'border-border hover:bg-muted/50',
-                  )}
-                >
-                  <RadioGroupItem value="custom" id="mode-custom" className="mt-0.5" />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <PenLine className="h-4 w-4 text-primary" />
-                      <span className="text-sm font-medium">
-                        {t('import.modeCustom', 'Enter a custom folder name')}
-                      </span>
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t('import.modeCustomDesc', 'Manually type the target mail folder name.')}
-                    </p>
-                    {folderMode === 'custom' && (
-                      <div className="mt-2">
-                        <Input
-                          className="h-8 text-xs max-w-xs"
-                          value={folder}
-                          onChange={(e) => setFolder(e.target.value)}
-                          placeholder="INBOX"
-                        />
-                      </div>
-                    )}
-                  </div>
-                </label>
-              </RadioGroup>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Step 3: File upload */}
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-sm font-medium">
-                {t('import.chooseFiles', '3. Choose files')}
+                {t('import.chooseFiles', '2. Choose files')}
               </CardTitle>
               <CardDescription className="text-xs">
                 {t('import.limits', {
@@ -621,7 +430,7 @@ export default function ImportPage() {
                       )}
                     >
                       <FileText className="h-4 w-4 shrink-0" />
-                      <span className="flex-1 truncate">{qf.file.name}</span>
+                      <span className="text-xs flex-1 truncate">{qf.file.name}</span>
                       <span className={cn('text-xs shrink-0', qf.sizeOk && qf.typeOk ? 'text-muted-foreground' : 'font-medium')}>
                         {formatSize(qf.file.size)}
                       </span>
@@ -649,9 +458,194 @@ export default function ImportPage() {
                   ))}
                 </div>
               )}
+              {files.length === 0 && phase === 'idle' && (
+                <div className="mt-3 text-xs text-destructive flex items-center gap-1.5">
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  <span>{t('import.noFilesSelected')}</span>
+                </div>
+              )}
             </CardContent>
           </Card>
+          {/* Step 3: Folder determination mode */}
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="text-sm font-medium">
+                {isPstSelected
+                  ? t('import.folderStructure', '3. Folder structure')
+                  : t('import.folderMethod', '3. Choose folder method')}
+              </CardTitle>
+              <CardDescription className="text-xs">
+                {isPstSelected
+                  ? t('import.pstFolderDesc', 'The PST file contains its own folder structure (e.g. Inbox, Sent Items, etc.). Folders will be automatically created during import.')
+                  : files.length === 0
+                    ? t('import.selectFileFirst', 'Select a file first to determine available options.')
+                    : t('import.folderMethodDesc', 'How should the target mail folder be determined?')}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {!isPstSelected && (
+                <RadioGroup
+                  value={folderMode}
+                  onValueChange={(v) => handleModeChange(v as FolderMode)}
+                  className="gap-3"
+                >
+                  {/* Mode 1: Auto-detect from headers */}
+                  <label
+                    className={cn(
+                      'flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors',
+                      folderMode === 'header'
+                        ? 'border-primary bg-primary/5'
+                        : 'border-border hover:bg-muted/50',
+                    )}
+                  >
+                    <RadioGroupItem value="header" id="mode-header" className="mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="h-4 w-4 text-primary" />
+                        <span className="text-xs font-medium">
+                          {t('import.modeHeader', 'Auto-detect from email headers')}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {t('import.modeHeaderDesc', 'Read X-Gmail-Labels / X-Bichon-Metadata from the uploaded file. Falls back to filename.')}
+                      </p>
+                      {folderMode === 'header' && (
+                        <div className="mt-2 flex items-center gap-2">
+                          <Badge variant="secondary" className="text-xs font-normal">
+                            {folderHint
+                              ? t('import.detectedFolder', 'Detected') + ': ' + headerFolder
+                              : t('import.noFileYet', 'No file selected yet')}
+                          </Badge>
+                          {folderHint && (
+                            <span className="text-[10px] text-muted-foreground">
+                              ({t('import.source')}: {folderHintLabel(folderHint)}{files.length > 1 && `, ${folderHint.fileName}`})
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </label>
 
+                  {/* Mode 2: Pick from existing mailboxes */}
+                  <label
+                    className={cn(
+                      'flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors',
+                      folderMode === 'existing'
+                        ? 'border-primary bg-primary/5'
+                        : 'border-border hover:bg-muted/50',
+                      !accountId && 'opacity-50 pointer-events-none',
+                    )}
+                  >
+                    <RadioGroupItem value="existing" id="mode-existing" className="mt-0.5" disabled={!accountId} />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <ListTree className="h-4 w-4 text-primary" />
+                        <span className="text-xs font-medium">
+                          {t('import.modeExisting', 'Choose from existing mailboxes')}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {t('import.modeExistingDesc', 'Select one of the mailboxes already present in this account.')}
+                      </p>
+                      {folderMode === 'existing' && (
+                        <div className="mt-2">
+                          {mailboxes.length === 0 ? (
+                            <span className="text-xs text-muted-foreground">
+                              {accountId
+                                ? t('import.noMailboxes', 'No mailboxes found in this account.')
+                                : t('import.selectAccountFirst', 'Select an account first.')}
+                            </span>
+                          ) : (
+                            <Popover open={mailboxOpen} onOpenChange={setMailboxOpen}>
+                              <PopoverTrigger asChild>
+                                <Button
+                                  variant="outline"
+                                  role="combobox"
+                                  className="h-8 justify-between text-xs max-w-xs w-full"
+                                >
+                                  <span className="truncate">
+                                    {folder || t('import.selectMailbox', 'Select a mailbox...')}
+                                  </span>
+                                  <ChevronsUpDown className="ml-2 h-3.5 w-3.5 shrink-0 opacity-50" />
+                                </Button>
+                              </PopoverTrigger>
+                              <PopoverContent className="w-[280px] p-0" align="start">
+                                <Command>
+                                  <CommandInput
+                                    placeholder={t('import.searchMailbox', 'Search mailboxes...')}
+                                    className="h-9 text-xs"
+                                  />
+                                  <CommandList>
+                                    <CommandEmpty>
+                                      {t('import.noMailboxFound', 'No mailbox found.')}
+                                    </CommandEmpty>
+                                    <CommandGroup>
+                                      {mailboxes.map((mb) => (
+                                        <CommandItem
+                                          key={mb.id}
+                                          value={mb.name}
+                                          onSelect={(value) => {
+                                            setFolder(value);
+                                            setMailboxOpen(false);
+                                          }}
+                                          className='text-xs'
+                                        >
+                                          <Check
+                                            className={cn(
+                                              'h-4 w-4',
+                                              folder === mb.name ? 'opacity-100' : 'opacity-0',
+                                            )}
+                                          />
+                                          {mb.name}
+                                        </CommandItem>
+                                      ))}
+                                    </CommandGroup>
+                                  </CommandList>
+                                </Command>
+                              </PopoverContent>
+                            </Popover>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </label>
+
+                  {/* Mode 3: Manual input */}
+                  <label
+                    className={cn(
+                      'flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors',
+                      folderMode === 'custom'
+                        ? 'border-primary bg-primary/5'
+                        : 'border-border hover:bg-muted/50',
+                    )}
+                  >
+                    <RadioGroupItem value="custom" id="mode-custom" className="mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <PenLine className="h-4 w-4 text-primary" />
+                        <span className="text-xs font-medium">
+                          {t('import.modeCustom', 'Enter a custom folder name')}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {t('import.modeCustomDesc', 'Manually type the target mail folder name.')}
+                      </p>
+                      {folderMode === 'custom' && (
+                        <div className="mt-2 text-xs">
+                          <Input
+                            className="h-8 text-xs max-w-xs"
+                            value={folder}
+                            onChange={(e) => setFolder(e.target.value)}
+                            placeholder="inbox"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </label>
+                </RadioGroup>
+              )}
+            </CardContent>
+          </Card>
           {/* Step 4: Progress & Results */}
           {(phase !== 'idle' || progress) && (
             <Card>
@@ -677,18 +671,11 @@ export default function ImportPage() {
                   <div className="space-y-1.5">
                     <div className="flex justify-between text-xs text-muted-foreground">
                       <span>
-                        {t('import.processed', { current: progress.success + progress.failed, total: progress.total })}
+                        {t('import.processed', { current: processedCount, total: progress.total })}
                       </span>
-                      <span>
-                        {progress.total > 0
-                          ? Math.round(((progress.success + progress.failed) / progress.total) * 100)
-                          : 0}%
-                      </span>
+                      <span>{Math.round(processedPct)}%</span>
                     </div>
-                    <Progress
-                      value={progress.total > 0 ? ((progress.success + progress.failed) / progress.total) * 100 : 0}
-                      className="h-2"
-                    />
+                    <Progress value={processedPct} className="h-2" />
                   </div>
                 )}
 
@@ -702,6 +689,12 @@ export default function ImportPage() {
                       <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
                       {t('import.failedCount', { count: progress.failed })}
                     </span>
+                    {progress.duplicates > 0 && (
+                      <span className="flex items-center gap-1" title={t('import.duplicateCountHint')}>
+                        <Copy className="h-3.5 w-3.5 text-muted-foreground" />
+                        {t('import.duplicateCount', { count: progress.duplicates })}
+                      </span>
+                    )}
                   </div>
                 )}
 
@@ -725,27 +718,43 @@ export default function ImportPage() {
             </Card>
           )}
 
-          {/* Import button */}
-          <div className="flex justify-between items-center">
-            <div className="text-xs text-muted-foreground">
-              {isPstSelected
-                ? t('import.pstFolders', 'PST folder structure will be preserved during import')
-                : (<>{t('import.willImportTo', 'Will import to')}: <span className="font-medium text-foreground">{effectiveFolder}</span></>)}
+          <div className="flex flex-col gap-2">
+            <div className="flex justify-between items-center">
+              <div className="text-xs text-muted-foreground">
+                {isPstSelected
+                  ? t('import.pstFolders', 'PST folder structure will be preserved during import')
+                  : (<>{t('import.willImportTo', 'Will import to')}: <span className="font-medium text-foreground">{effectiveFolder}</span>{files.length > 1 && <> · {t('import.fileCount', { count: files.length })}</>}</>)}
+              </div>
+              <Button
+                onClick={() => importMutation.mutate()}
+                disabled={!canImport || importMutation.isPending}
+                className="gap-2"
+              >
+                {importMutation.isPending ? (
+                  <Upload className="h-4 w-4 animate-pulse" />
+                ) : (
+                  <Upload className="h-4 w-4" />
+                )}
+                {t('import.startImport', 'Import')}
+              </Button>
             </div>
-            <Button
-              onClick={() => importMutation.mutate()}
-              disabled={!canImport || importMutation.isPending}
-              className="gap-2"
-            >
-              {importMutation.isPending ? (
-                <Upload className="h-4 w-4 animate-pulse" />
-              ) : (
-                <Upload className="h-4 w-4" />
-              )}
-              {t('import.startImport', 'Import')}
-            </Button>
+            {(!accountId || files.length === 0) && (
+              <div className="text-xs text-destructive flex items-center justify-end gap-1.5">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                <span>
+                  {!accountId && !files.length && (
+                    t('import.selectAccountAndFiles', 'Please select a target account and files first.')
+                  )}
+                  {!accountId && files.length > 0 && (
+                    t('import.selectAccountRequired', 'Please select a target account first.')
+                  )}
+                  {accountId && files.length === 0 && (
+                    t('import.selectFilesRequired', 'Please select files to import.')
+                  )}
+                </span>
+              </div>
+            )}
           </div>
-
           {/* Import history */}
           {history.length > 0 && (
             <CollapsibleHistory

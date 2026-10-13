@@ -41,7 +41,7 @@ interface MailListProps {
   items: EmailEnvelope[]
   isLoading: boolean
   onEnvelopeChanged: (envelope: EmailEnvelope) => void
-  setSortBy: (sortBy: "DATE" | "SIZE") => void
+  setSortBy: (sortBy: "DATE" | "SIZE" | "RELEVANCE") => void
   setSortOrder: (value: "desc" | "asc") => void
 }
 
@@ -55,7 +55,7 @@ export function MailListTable({
   const { t, i18n } = useTranslation()
 
   const locale = dateFnsLocaleMap[i18n.language.toLowerCase()] ?? enUS
-  const { selected, setSelected } = useSearchContext()
+  const { selected, setSelected, dateDisplay } = useSearchContext()
 
   const columns: ColumnDef<EmailEnvelope>[] = [
     {
@@ -91,10 +91,10 @@ export function MailListTable({
       cell: ({ row }) => {
         const { from, account_email, account_name, mailbox_name, account_id, mailbox_id } = row.original;
         const { setFilter } = useSearchMessages();
-        const accountPrefix = account_name ?? account_email.split('@')[0];//https://github.com/rustmailer/bichon/issues/306
+        const accountPrefix = account_name || account_email.split('@')[0];//https://github.com/rustmailer/bichon/issues/306
 
         return (
-          <div className="flex flex-col py-1.5 min-w-0 group">
+          <div className="flex flex-col py-0.5 min-w-0 group">
             <div
               className="cursor-pointer hover:text-primary transition-colors flex items-center gap-1.5"
               onClick={(e) => {
@@ -151,7 +151,7 @@ export function MailListTable({
         };
 
         return (
-          <div className="group relative flex items-center w-full min-w-0 px-2 py-1.5 overflow-hidden">
+          <div className="group relative flex items-center w-full min-w-0 px-2 py-0.5 overflow-hidden">
             <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-primary opacity-0 group-hover:opacity-100 transition-opacity" />
             <div className="text-xs flex flex-wrap items-center gap-x-1 gap-y-0.5 min-w-0 flex-1">
               {visible.map((email, index) => (
@@ -207,7 +207,7 @@ export function MailListTable({
       cell: ({ row }) => {
         const tags = row.original.tags ?? [];
         return (
-          <div className="flex flex-col gap-1 py-1.5 min-w-0">
+          <div className="flex flex-col gap-1 py-0.5 min-w-0">
             <LongText className='text-xs font-medium truncate'>
               {row.original.subject}
             </LongText>
@@ -290,15 +290,18 @@ export function MailListTable({
       ),
       cell: ({ row }) => {
         const date = new Date(row.original.date)
-        const title = format(date, 'yyyy-MM-dd HH:mm:ss')
+        const absolute = format(date, 'yyyy-MM-dd HH:mm')
+        const relative = formatDistanceToNow(date, { addSuffix: true, locale })
         return (
           <Tooltip>
             <TooltipTrigger asChild>
               <span className='text-xs whitespace-nowrap'>
-                {formatDistanceToNow(date, { addSuffix: true, locale })}
+                {dateDisplay === 'absolute' ? absolute : relative}
               </span>
             </TooltipTrigger>
-            <TooltipContent>{title}</TooltipContent>
+            <TooltipContent>
+              {dateDisplay === 'absolute' ? relative : format(date, 'yyyy-MM-dd HH:mm:ss')}
+            </TooltipContent>
           </Tooltip>
         )
       },

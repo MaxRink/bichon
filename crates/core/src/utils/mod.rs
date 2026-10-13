@@ -29,6 +29,7 @@ pub mod encrypt;
 pub mod html;
 pub mod net;
 pub mod rate_limit;
+pub mod totp;
 pub mod shutdown;
 pub mod tls;
 
@@ -107,7 +108,7 @@ macro_rules! raise_error {
         $crate::error::BichonError::Generic {
             message: $msg,
             code: $code,
-            location: snafu::location!(),
+            location: $crate::error::snafu::location!(),
         }
     };
 }

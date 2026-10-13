@@ -17,10 +17,11 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import { Loader, Download, Trash2, MessageSquareMore, FileText, FileImage, FileVideo, FileArchive, FileSpreadsheet, FileCode, FileIcon, FileAudio, Upload, ShieldCheck } from 'lucide-react';
+import { Loader, Download, Trash2, MessageSquareMore, FileText, FileImage, FileVideo, FileArchive, FileSpreadsheet, FileCode, FileIcon, FileAudio, Upload, ShieldCheck, Pencil } from 'lucide-react';
 
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -53,6 +54,7 @@ interface MailMessageViewProps {
     bcc?: string[];
     subject?: string;
     internal_date?: number;
+    tags: string[];
   };
   showActions?: boolean;
   showHeader?: boolean;
@@ -121,7 +123,7 @@ export function MailMessageView({
   showHeader = true
 }: MailMessageViewProps) {
   const { t } = useTranslation()
-  const { setToDelete, setOpen, setSelected } = useSearchContext();
+  const { setToDelete, setOpen, setSelected, setEditTagsOpen } = useSearchContext();
   const [content, setContent] = useState<string | null>(null);
   const [contentType, setContentType] = useState<'Plain' | 'Html' | null>(null);
   const [attachments, setAttachments] = useState<AttachmentInfo[] | null>(null);
@@ -175,7 +177,11 @@ export function MailMessageView({
     setBlockRemote(true);
   }, [envelope.id]);
 
+  const loadedKeyRef = useRef('');
   useEffect(() => {
+    const key = `${envelope.account_id}:${envelope.id}:${blockRemote}`;
+    if (loadedKeyRef.current === key) return;
+    loadedKeyRef.current = key;
     setLoading(true);
     loadMessageMutation.mutate();
   }, [envelope.id, blockRemote]);
@@ -229,7 +235,7 @@ export function MailMessageView({
   };
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col">
       {showHeader && <div className="grid gap-1 text-xs">
         <div className="flex space-x-2">
           <span className="font-medium text-gray-400">{t('mail.account')}:</span>
@@ -260,6 +266,28 @@ export function MailMessageView({
             <span>{formatTimestamp(envelope.internal_date)}</span>
           </div>
         )}
+        <div className="flex items-center space-x-2">
+          <span className="font-medium text-gray-400">{t('mail.tags')}:</span>
+          <div className="flex flex-wrap gap-1 items-center">
+            {envelope.tags && envelope.tags.length > 0 ? (
+              envelope.tags.map((tag) => (
+                <Badge key={tag} variant="secondary" className="text-[10px] h-5 px-1.5">
+                  {tag}
+                </Badge>
+              ))
+            ) : (
+              <span className="text-gray-400 italic">{t('mail.noTagsYet')}</span>
+            )}
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-5 w-5 ml-0.5"
+              onClick={() => setEditTagsOpen(true)}
+            >
+              <Pencil className="h-3 w-3" />
+            </Button>
+          </div>
+        </div>
       </div>}
 
       {showActions && (
@@ -268,7 +296,7 @@ export function MailMessageView({
             <Separator orientation="horizontal" className="flex-1 bg-border" />
           </div>
           <div className="flex items-center justify-start gap-3 text-xs text-gray-500">
-            <Tooltip>
+            <Tooltip delayDuration={800}>
               <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon" onClick={handleDelete} className="hover:text-destructive">
                   <Trash2 className="h-4 w-4" />
@@ -277,7 +305,7 @@ export function MailMessageView({
               <TooltipContent>{t('mail.delete')}</TooltipContent>
             </Tooltip>
             <Separator orientation="vertical" className="h-5" />
-            <Tooltip>
+            <Tooltip delayDuration={800}>
               <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon" onClick={downloadEmlFile}>
                   <Download className="h-4 w-4" />
@@ -286,7 +314,7 @@ export function MailMessageView({
               <TooltipContent>{t('mail.download')}</TooltipContent>
             </Tooltip>
             <Separator orientation="vertical" className="h-5" />
-            <Tooltip>
+            <Tooltip delayDuration={800}>
               <TooltipTrigger asChild>
                 <Button
                   variant="ghost"
@@ -299,7 +327,7 @@ export function MailMessageView({
               <TooltipContent>{t('mail.viewThread')}</TooltipContent>
             </Tooltip>
             <Separator orientation="vertical" className="h-5" />
-            <Tooltip>
+            <Tooltip delayDuration={800}>
               <TooltipTrigger asChild>
                 <Button
                   variant="ghost"
@@ -432,7 +460,7 @@ export function MailMessageView({
           </span>
         </div>
       )}
-      <div className="flex-1 overflow-auto">
+      <div>
         {loading ? (
           <div className="flex justify-center items-center py-8">
             <Loader className="w-6 h-6 animate-spin" />

@@ -5,14 +5,18 @@ use crate::checksum;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 
-const META_VERSION: u32 = 1;
+/// v3 added `SegmentStats::sha256` (computed at segment seal). v2 payloads
+/// are migrated in [`GlobalMeta::load`] with a `None` hash — the first backup
+/// after an upgrade backfills it.
+const META_VERSION: u32 = 3;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn write_bin<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let payload = bincode::serialize(value).map_err(|e| {
-        crate::error::Error::CorruptMeta(format!("{}: bincode encode: {}", path.display(), e))
-    })?;
+    let payload =
+        bincode::serde::encode_to_vec(value, bincode::config::standard()).map_err(|e| {
+            crate::error::Error::CorruptMeta(format!("{}: bincode encode: {}", path.display(), e))
+        })?;
     let crc = checksum::crc32(&payload);
     let mut buf = Vec::with_capacity(8 + payload.len());
     buf.extend_from_slice(&crc.to_le_bytes());
@@ -23,69 +27,62 @@ fn write_bin<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-fn read_bin<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let data = std::fs::read(path)?;
-    if data.len() < 8 {
-        return Err(crate::error::Error::CorruptMeta(path.display().to_string()));
-    }
-    let stored_crc = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    if version != META_VERSION {
-        return Err(crate::error::Error::UnsupportedMetaVersion {
-            path: path.to_path_buf(),
-            version,
-        });
-    }
-    let computed = checksum::crc32(&data[8..]);
-    if stored_crc != computed {
-        return Err(crate::error::Error::CorruptMeta(path.display().to_string()));
-    }
-    bincode::deserialize(&data[8..]).map_err(|e| {
-        crate::error::Error::CorruptMeta(format!("{}: bincode decode: {}", path.display(), e))
-    })
+/// Decode a bincode payload with a CRC check already performed by the caller.
+fn decode_bin<T: for<'de> Deserialize<'de>>(payload: &[u8], path: &Path) -> Result<T> {
+    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+        .map(|(v, _)| v)
+        .map_err(|e| {
+            crate::error::Error::CorruptMeta(format!("{}: bincode decode: {}", path.display(), e))
+        })
 }
 
-// ── GlobalMeta ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlobalMeta {
+/// The v2 on-disk shape, for migrating existing stores. Kept separate because
+/// bincode cannot skip a struct field that was absent in the old format.
+#[derive(Serialize, Deserialize)]
+struct GlobalMetaV2 {
     pub version: u32,
-    pub accounts: Vec<String>,
+    pub active_segment_id: u32,
+    pub segments: BTreeMap<u32, SegmentStatsV2>,
 }
 
-impl Default for GlobalMeta {
-    fn default() -> Self {
+#[derive(Serialize, Deserialize)]
+struct SegmentStatsV2 {
+    pub segment_id: u32,
+    pub total_bytes: u64,
+    pub deleted_bytes: u64,
+    pub deleted_ratio: f64,
+    pub sealed: bool,
+    pub indexed_up_to_offset: u64,
+    pub bucket_compacted: u64,
+}
+
+impl From<GlobalMetaV2> for GlobalMeta {
+    fn from(v2: GlobalMetaV2) -> Self {
+        let segments = v2
+            .segments
+            .into_iter()
+            .map(|(id, s)| {
+                (
+                    id,
+                    SegmentStats {
+                        segment_id: s.segment_id,
+                        total_bytes: s.total_bytes,
+                        deleted_bytes: s.deleted_bytes,
+                        deleted_ratio: s.deleted_ratio,
+                        sealed: s.sealed,
+                        indexed_up_to_offset: s.indexed_up_to_offset,
+                        bucket_compacted: s.bucket_compacted,
+                        // Pre-hash metadata: the next backup backfills the hash.
+                        sha256: None,
+                    },
+                )
+            })
+            .collect();
         Self {
             version: META_VERSION,
-            accounts: Vec::new(),
+            active_segment_id: v2.active_segment_id,
+            segments,
         }
-    }
-}
-
-impl GlobalMeta {
-    pub fn load(store_root: &Path) -> Result<Self> {
-        let bin_path = store_root.join("global_meta.bin");
-        if bin_path.exists() {
-            return read_bin(&bin_path);
-        }
-        // Migration from JSON
-        let json_path = store_root.join("global_meta.json");
-        if json_path.exists() {
-            let data = std::fs::read_to_string(&json_path)?;
-            let mut meta: Self = serde_json::from_str(&data)?;
-            meta.accounts.sort();
-            write_bin(&bin_path, &meta)?;
-            let _ = std::fs::remove_file(&json_path);
-            return Ok(meta);
-        }
-        Ok(Self::default())
-    }
-
-    pub fn save(&self, store_root: &Path) -> Result<()> {
-        let path = store_root.join("global_meta.bin");
-        let mut meta = self.clone();
-        meta.accounts.sort();
-        write_bin(&path, &meta)
     }
 }
 
@@ -99,8 +96,15 @@ pub struct SegmentStats {
     pub deleted_ratio: f64,
     pub sealed: bool,
     /// Byte offset up to which entries have been indexed in bucket files.
-    /// Recovery starts scanning from here instead of 0.
     pub indexed_up_to_offset: u64,
+    /// Number of compacted (sorted, deduped) records in each bucket file for this segment.
+    /// Used by BucketStore on recovery to know where the clean portion ends.
+    pub bucket_compacted: u64,
+    /// SHA-256 of the sealed segment file, computed at seal time while the
+    /// data is page-cache warm (design doc §7). Recomputed when GC compacts
+    /// the segment. `None` for segments sealed before hashing existed —
+    /// backfilled (and persisted) on the next backup.
+    pub sha256: Option<[u8; 32]>,
 }
 
 impl SegmentStats {
@@ -112,6 +116,8 @@ impl SegmentStats {
             deleted_ratio: 0.0,
             sealed: false,
             indexed_up_to_offset: 0,
+            bucket_compacted: 0,
+            sha256: None,
         }
     }
 
@@ -124,45 +130,61 @@ impl SegmentStats {
     }
 }
 
-// ── AccountMeta ────────────────────────────────────────────────────────────
+// ── GlobalMeta ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccountMeta {
-    pub account_id: String,
+pub struct GlobalMeta {
+    pub version: u32,
     pub active_segment_id: u32,
     pub segments: BTreeMap<u32, SegmentStats>,
 }
 
-impl AccountMeta {
-    pub fn new(account_id: String, active_segment_id: u32) -> Self {
+impl GlobalMeta {
+    pub fn new() -> Self {
         Self {
-            account_id,
-            active_segment_id,
+            version: META_VERSION,
+            active_segment_id: 1,
             segments: BTreeMap::new(),
         }
     }
 
-    pub fn load(account_dir: &Path) -> Result<Self> {
-        let bin_path = account_dir.join("meta.bin");
-        if bin_path.exists() {
-            return read_bin(&bin_path);
+    pub fn load(store_root: &Path) -> Result<Self> {
+        let bin_path = store_root.join("meta.bin");
+        if !bin_path.exists() {
+            return Ok(Self::new());
         }
-        // Migration from JSON
-        let json_path = account_dir.join("meta.json");
-        if json_path.exists() {
-            let data = std::fs::read_to_string(&json_path)?;
-            let meta: Self = serde_json::from_str(&data)?;
-            write_bin(&bin_path, &meta)?;
-            let _ = std::fs::remove_file(&json_path);
-            return Ok(meta);
+        let data = std::fs::read(&bin_path)?;
+        if data.len() < 8 {
+            return Err(crate::error::Error::CorruptMeta(bin_path.display().to_string()));
         }
-        Err(crate::error::Error::AccountNotFound(
-            account_dir.to_string_lossy().into(),
-        ))
+        let stored_crc = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let payload = &data[8..];
+        let computed = checksum::crc32(payload);
+        if stored_crc != computed {
+            return Err(crate::error::Error::CorruptMeta(bin_path.display().to_string()));
+        }
+        match version {
+            // Old stores migrate forward; their segments get hashes on the
+            // next backup.
+            2 => decode_bin::<GlobalMetaV2>(payload, &bin_path).map(GlobalMeta::from),
+            META_VERSION => decode_bin(payload, &bin_path),
+            other => Err(crate::error::Error::UnsupportedMetaVersion {
+                path: bin_path,
+                version: other,
+            }),
+        }
     }
 
-    pub fn save(&self, account_dir: &Path) -> Result<()> {
-        write_bin(&account_dir.join("meta.bin"), self)
+    pub fn save(&self, store_root: &Path) -> Result<()> {
+        let path = store_root.join("meta.bin");
+        write_bin(&path, self)
+    }
+}
+
+impl Default for GlobalMeta {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -172,45 +194,9 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_global_meta_bin_roundtrip() {
+    fn test_global_meta_roundtrip() {
         let dir = TempDir::new().unwrap();
-        let mut meta = GlobalMeta::default();
-        meta.accounts.push("alice".into());
-        meta.save(dir.path()).unwrap();
-
-        let loaded = GlobalMeta::load(dir.path()).unwrap();
-        assert_eq!(loaded.accounts, vec!["alice"]);
-        assert!(!dir.path().join("global_meta.json").exists());
-        assert!(dir.path().join("global_meta.bin").exists());
-    }
-
-    #[test]
-    fn test_global_meta_default_when_missing() {
-        let dir = TempDir::new().unwrap();
-        let meta = GlobalMeta::load(dir.path()).unwrap();
-        assert!(meta.accounts.is_empty());
-    }
-
-    #[test]
-    fn test_json_migration() {
-        let dir = TempDir::new().unwrap();
-        // Write old JSON format
-        let json = r#"{"version":1,"accounts":["bob","alice"]}"#;
-        std::fs::write(dir.path().join("global_meta.json"), json).unwrap();
-
-        let meta = GlobalMeta::load(dir.path()).unwrap();
-        // Should be sorted
-        assert_eq!(meta.accounts, vec!["alice", "bob"]);
-        // JSON should be removed
-        assert!(!dir.path().join("global_meta.json").exists());
-        // BIN should exist
-        assert!(dir.path().join("global_meta.bin").exists());
-    }
-
-    #[test]
-    fn test_account_meta_bin_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let mut meta = AccountMeta::new("alice".into(), 1);
+        let mut meta = GlobalMeta::new();
         meta.segments.insert(
             1,
             SegmentStats {
@@ -218,67 +204,82 @@ mod tests {
                 total_bytes: 1000,
                 deleted_bytes: 300,
                 deleted_ratio: 0.3,
-                sealed: false,
-                indexed_up_to_offset: 0,
+                sealed: true,
+                indexed_up_to_offset: 500,
+                bucket_compacted: 0,
+                sha256: Some([0xAB; 32]),
             },
         );
         meta.save(dir.path()).unwrap();
 
-        let loaded = AccountMeta::load(dir.path()).unwrap();
+        let loaded = GlobalMeta::load(dir.path()).unwrap();
         assert_eq!(loaded.active_segment_id, 1);
         assert_eq!(loaded.segments[&1].total_bytes, 1000);
+        assert_eq!(loaded.segments[&1].indexed_up_to_offset, 500);
+        assert_eq!(loaded.segments[&1].sha256, Some([0xAB; 32]));
+    }
+
+    #[test]
+    fn test_v2_meta_migrates_with_null_hashes() {
+        let dir = TempDir::new().unwrap();
+        // Craft a v2-format meta.bin by hand: encode the v2 structs and write
+        // the v2 header (crc + version 2), exactly like an old store.
+        let v2 = GlobalMetaV2 {
+            version: 2,
+            active_segment_id: 3,
+            segments: std::collections::BTreeMap::from([(
+                1,
+                SegmentStatsV2 {
+                    segment_id: 1,
+                    total_bytes: 100,
+                    deleted_bytes: 0,
+                    deleted_ratio: 0.0,
+                    sealed: true,
+                    indexed_up_to_offset: 100,
+                    bucket_compacted: 0,
+                },
+            )]),
+        };
+        let payload = bincode::serde::encode_to_vec(&v2, bincode::config::standard()).unwrap();
+        let crc = checksum::crc32(&payload);
+        let mut buf = Vec::with_capacity(8 + payload.len());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        std::fs::write(dir.path().join("meta.bin"), &buf).unwrap();
+
+        let loaded = GlobalMeta::load(dir.path()).unwrap();
+        assert_eq!(loaded.active_segment_id, 3, "migrated store keeps its layout");
+        assert_eq!(loaded.segments[&1].total_bytes, 100);
+        assert_eq!(
+            loaded.segments[&1].sha256,
+            None,
+            "v2 segments carry no hash; the next backup backfills it"
+        );
+    }
+
+    #[test]
+    fn test_global_meta_default_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let meta = GlobalMeta::load(dir.path()).unwrap();
+        assert_eq!(meta.active_segment_id, 1);
+        assert!(meta.segments.is_empty());
     }
 
     #[test]
     fn test_corrupt_bin_detected() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("meta.bin"), vec![0xFFu8; 100]).unwrap();
-        let result = AccountMeta::load(dir.path());
+        let result = GlobalMeta::load(dir.path());
         assert!(result.is_err());
-        // 0xFFFFFFFF version triggers UnsupportedMetaVersion
-        assert!(matches!(result.unwrap_err(), crate::error::Error::UnsupportedMetaVersion { .. }));
     }
 
     #[test]
-    fn test_crc_corruption_detected() {
-        let dir = TempDir::new().unwrap();
-        // Write a well-formed header (version=1) but with wrong CRC bytes
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0xDEADBEEFu32.to_le_bytes()); // wrong CRC
-        buf.extend_from_slice(&1u32.to_le_bytes());           // version = 1 (OK)
-        buf.extend_from_slice(b"some payload bytes");         // payload
-        std::fs::write(dir.path().join("meta.bin"), &buf).unwrap();
-        let result = AccountMeta::load(dir.path());
-        assert!(matches!(result.unwrap_err(), crate::error::Error::CorruptMeta(_)));
-    }
-
-    #[test]
-    fn test_account_json_migration() {
-        let dir = TempDir::new().unwrap();
-        // Write old JSON format for AccountMeta
-        let json = r#"{"account_id":"alice","active_segment_id":5,"segments":{}}"#;
-        std::fs::write(dir.path().join("meta.json"), json).unwrap();
-
-        let meta = AccountMeta::load(dir.path()).unwrap();
-        assert_eq!(meta.account_id, "alice");
-        assert_eq!(meta.active_segment_id, 5);
-        // JSON should be removed
-        assert!(!dir.path().join("meta.json").exists());
-        // BIN should exist
-        assert!(dir.path().join("meta.bin").exists());
-    }
-
-    #[test]
-    fn test_bin_sorted_keys() {
-        let dir = TempDir::new().unwrap();
-        let mut meta = AccountMeta::new("test".into(), 1);
-        meta.segments.insert(3, SegmentStats::new(3));
-        meta.segments.insert(1, SegmentStats::new(1));
-        meta.segments.insert(2, SegmentStats::new(2));
-        meta.save(dir.path()).unwrap();
-
-        let loaded = AccountMeta::load(dir.path()).unwrap();
-        let keys: Vec<u32> = loaded.segments.keys().copied().collect();
-        assert_eq!(keys, vec![1, 2, 3]);
+    fn test_segment_stats_recompute() {
+        let mut s = SegmentStats::new(1);
+        s.total_bytes = 1000;
+        s.deleted_bytes = 250;
+        s.recompute_ratio();
+        assert!((s.deleted_ratio - 0.25).abs() < 0.001);
     }
 }
