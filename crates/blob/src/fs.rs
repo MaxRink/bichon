@@ -98,7 +98,14 @@ pub fn pread_exact(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileExt;
-        file.seek_read(buf, offset)?;
+        let mut read = 0;
+        while read < buf.len() {
+            let count = file.seek_read(&mut buf[read..], offset + read as u64)?;
+            if count == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short positional read").into());
+            }
+            read += count;
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {

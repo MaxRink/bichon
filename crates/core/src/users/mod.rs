@@ -285,9 +285,11 @@ impl BichonUserV2 {
     }
 
     pub fn to_view(self, role_lookup: &BTreeMap<u64, UserRole>) -> UserView {
+        let live_global_roles = self.effective_global_roles();
         let global_roles_names = self
             .global_roles
             .iter()
+            .filter(|role_id| live_global_roles.contains(role_id))
             .filter_map(|role_id| role_lookup.get(role_id))
             .map(|role| role.name.clone())
             .collect();
@@ -367,7 +369,7 @@ impl BichonUserV2 {
             account_access_map: self.account_access_map,
             account_roles_summary,
             description: self.description,
-            global_roles: self.global_roles,
+            global_roles: live_global_roles,
             global_roles_names,
             global_role_expiries: live_global,
             account_role_expiries: live_scoped,

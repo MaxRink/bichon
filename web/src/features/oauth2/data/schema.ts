@@ -28,7 +28,7 @@ export interface OAuth2Entity {
   scopes?: string[];
   extra_params?: Record<string, string>;
   enabled: boolean;
-  use_proxy?: number;
+  use_proxy?: number | null;
   created_at: number;
   updated_at: number;
 }

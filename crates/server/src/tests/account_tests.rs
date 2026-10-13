@@ -18,6 +18,8 @@ fn api_client(route: impl poem::Endpoint) -> TestClient<impl poem::Endpoint> {
 struct CreateAccountPayload {
     email: String,
     enabled: bool,
+    deleting: bool,
+    deleting: bool,
     account_type: String,
     use_dangerous: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,10 +131,12 @@ async fn account_crud() {
         .send()
         .await;
     let status = resp.0.status();
-    assert!(
-        status.is_success() || status.is_client_error(),
-        "after delete the account must be gone or soft-deleting, got {status}"
-    );
+    if status.is_success() {
+        let account: AccountResp = resp.json().await.value().deserialize();
+        assert!(account.deleting, "successful post-delete read must be soft-deleting");
+    } else {
+        assert!(status.is_client_error(), "after delete the account must be gone or soft-deleting, got {status}");
+    }
 }
 
 #[tokio::test]
