@@ -21,7 +21,9 @@ use crate::rest::api::ApiTags;
 use crate::rest::ApiResult;
 use bichon_core::account::migration::AccountModel;
 use bichon_core::common::paginated::DataPage;
+use bichon_core::envelope::extractor::{repair_envelope_blobs, BlobRepairReport};
 use bichon_core::error::code::ErrorCode;
+use bichon_core::ext::event_bus::{emit, Event};
 use bichon_core::message::append::restore_emails;
 use bichon_core::message::append::RestoreMessagesRequest;
 use bichon_core::message::attachment::retrieve_attachment_content;
@@ -29,10 +31,7 @@ use bichon_core::message::attachment::retrieve_nested_attachment_content;
 use bichon_core::message::content::retrieve_nested_eml_content;
 use bichon_core::message::content::FullNestedMessageContent;
 use bichon_core::message::content::{retrieve_email_content, FullMessageContent};
-use bichon_core::message::delete::{
-    delete_messages_impl, emit_delete_audit, plan_delete_audit,
-};
-use bichon_core::ext::event_bus::{emit, Event};
+use bichon_core::message::delete::{delete_messages_impl, emit_delete_audit, plan_delete_audit};
 use bichon_core::message::list::get_thread_messages;
 use bichon_core::message::search::{search_messages_impl, EmailSearchRequest};
 use bichon_core::message::tags::TagCount;
@@ -284,6 +283,31 @@ impl MessageApi {
             .attachment_type(AttachmentType::Attachment)
             .filename(format!("{envelope_id}.eml"));
         Ok(attachment)
+    }
+
+    /// Re-fetches one archived message from IMAP and restores missing email or
+    /// attachment blobs in place. The envelope and its id are kept, so no
+    /// duplicate is created; nothing is written unless the fetched message
+    /// hashes to the archived content hash.
+    #[oai(
+        path = "/repair-message/:account_id/:envelope_id",
+        method = "post",
+        operation_id = "repair_message"
+    )]
+    async fn repair_message(
+        &self,
+        /// The ID of the account.
+        account_id: Path<u64>,
+        /// The ID of the message to repair.
+        envelope_id: Path<String>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<BlobRepairReport>> {
+        let account_id = account_id.0;
+        AccountModel::check_account_exists(account_id)?;
+        context.require_permission(Some(account_id), Permission::DATA_MANAGE)?;
+        Ok(Json(
+            repair_envelope_blobs(account_id, &envelope_id.0).await?,
+        ))
     }
 
     /// Restore an email to an account's IMAP server.

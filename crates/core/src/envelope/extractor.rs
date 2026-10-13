@@ -803,25 +803,10 @@ async fn recover_message_blob(envelope: &Envelope) -> BichonResult<Bytes> {
         })?;
 
     let mut session = ImapExecutor::create_connection(envelope.account_id).await?;
-    let result = ImapExecutor::fetch_single_message_body(
-        &mut session,
-        &mailbox.encoded_name(),
-        envelope.uid,
-    )
-    .await;
+    let result = fetch_archived_body(&mut session, &mailbox.encoded_name(), envelope).await;
     session.logout().await.ok();
     let raw_body = result?;
-
     let fetched_hash = compute_content_hash(&raw_body);
-    if fetched_hash != envelope.content_hash {
-        return Err(raise_error!(
-            format!(
-                "Fetched message does not match archived content: expected content_hash={} got={}",
-                envelope.content_hash, fetched_hash
-            ),
-            ErrorCode::ImapUnexpectedResult
-        ));
-    }
 
     // Re-create the detached blob (stripped EML + attachments) so the missing
     // blob is repopulated for future requests. The detached EML is queued under
@@ -851,9 +836,166 @@ async fn recover_message_blob(envelope: &Envelope) -> BichonResult<Bytes> {
     Ok(Bytes::from(raw_body))
 }
 
+/// Fetches the archived message from IMAP and returns it only if its content
+/// hash equals the archived `content_hash`. Tries the stored UID first, then
+/// the UIDs returned by `UID SEARCH HEADER Message-ID` (UID changed or the
+/// message moved within the folder).
+async fn fetch_archived_body(
+    session: &mut async_imap::Session<Box<dyn crate::imap::session::SessionStream>>,
+    encoded_mailbox: &str,
+    envelope: &Envelope,
+) -> BichonResult<Vec<u8>> {
+    let mut last_err = match ImapExecutor::fetch_single_message_body(
+        session,
+        encoded_mailbox,
+        envelope.uid,
+    )
+    .await
+    {
+        Ok(body) if compute_content_hash(&body) == envelope.content_hash => return Ok(body),
+        Ok(body) => raise_error!(
+            format!(
+                "Fetched message does not match archived content: expected content_hash={} got={}",
+                envelope.content_hash,
+                compute_content_hash(&body)
+            ),
+            ErrorCode::ImapUnexpectedResult
+        ),
+        Err(e) => e,
+    };
+
+    let message_id = envelope.message_id.trim();
+    if message_id.is_empty() || message_id.contains(['"', '\\', '\r', '\n']) {
+        return Err(last_err);
+    }
+    let uids = session
+        .uid_search(format!("HEADER Message-ID \"{}\"", message_id))
+        .await
+        .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::ImapUnexpectedResult))?;
+    let mut uids: Vec<u32> = uids.into_iter().filter(|&u| u != envelope.uid).collect();
+    uids.sort_unstable();
+    for uid in uids {
+        match ImapExecutor::fetch_single_message_body(session, encoded_mailbox, uid).await {
+            Ok(body) if compute_content_hash(&body) == envelope.content_hash => return Ok(body),
+            Ok(_) => {}
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// Outcome of [`repair_envelope_blobs`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
+pub struct BlobRepairReport {
+    pub envelope_id: String,
+    /// `complete` (nothing missing), `repaired`, `partial` or `failed`.
+    pub status: String,
+    pub email_blob_missing: bool,
+    pub missing_before: Vec<String>,
+    pub missing_after: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Content hashes referenced by `<<BICHON_DETACH_HASH:...>>` placeholders in a
+/// detached EML.
+fn placeholder_hashes(detached_eml: &[u8]) -> Vec<String> {
+    const PREFIX: &[u8] = b"<<BICHON_DETACH_HASH:";
+    let mut hashes = Vec::new();
+    let mut rest = detached_eml;
+    while let Some(pos) = rest.windows(PREFIX.len()).position(|w| w == PREFIX) {
+        rest = &rest[pos + PREFIX.len()..];
+        let Some(end) = rest.windows(2).position(|w| w == b">>") else {
+            break;
+        };
+        if let Ok(h) = std::str::from_utf8(&rest[..end]) {
+            if !hashes.iter().any(|x| x == h) {
+                hashes.push(h.to_string());
+            }
+        }
+        rest = &rest[end + 2..];
+    }
+    hashes
+}
+
+/// (email blob missing, attachment hashes missing from the blob store)
+fn missing_blobs(envelope: &Envelope) -> BichonResult<(bool, Vec<String>)> {
+    let Some(eml) = BLOB_MANAGER.get_email(&envelope.content_hash)? else {
+        return Ok((true, Vec::new()));
+    };
+    let mut missing = Vec::new();
+    for hash in placeholder_hashes(&eml) {
+        if BLOB_MANAGER.get_attachment(&hash)?.is_none() {
+            missing.push(hash);
+        }
+    }
+    Ok((false, missing))
+}
+
+/// Re-fetches one archived message from IMAP and restores its missing email
+/// or attachment blobs **in place**: the envelope, its id and its index entry
+/// are kept, so no duplicate is created. Nothing is written unless the
+/// fetched message hashes to the archived `content_hash`.
+pub async fn repair_envelope_blobs(
+    account_id: u64,
+    envelope_id: &str,
+) -> BichonResult<BlobRepairReport> {
+    let envelope = ENVELOPE_MANAGER
+        .get_envelope_by_id(account_id, envelope_id)?
+        .ok_or_else(|| {
+            raise_error!(
+                format!("Envelope not found: account_id={account_id} envelope_id={envelope_id}"),
+                ErrorCode::ResourceNotFound
+            )
+        })?
+        .envelope;
+
+    let (email_missing, missing_before) = missing_blobs(&envelope)?;
+    let mut report = BlobRepairReport {
+        envelope_id: envelope_id.to_string(),
+        email_blob_missing: email_missing,
+        missing_before,
+        ..Default::default()
+    };
+    if !email_missing && report.missing_before.is_empty() {
+        report.status = "complete".into();
+        return Ok(report);
+    }
+    if WRITE_GATE.is_paused() {
+        report.status = "failed".into();
+        report.error = Some("backup window open, blob store is read-only".into());
+        return Ok(report);
+    }
+    if let Err(e) = recover_message_blob(&envelope).await {
+        report.status = "failed".into();
+        report.error = Some(e.to_string());
+        return Ok(report);
+    }
+    // recover_message_blob only queues the write; wait for it to land.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), BLOB_MANAGER.drain()).await;
+    let (email_missing_after, missing_after) = missing_blobs(&envelope)?;
+    report.missing_after = missing_after;
+    report.status = if !email_missing_after && report.missing_after.is_empty() {
+        "repaired"
+    } else {
+        "partial"
+    }
+    .into();
+    Ok(report)
+}
+
 #[cfg(test)]
 mod test {
     use html2text::config;
+
+    #[test]
+    fn placeholder_hashes_finds_unique_hashes() {
+        let eml =
+            b"a<<BICHON_DETACH_HASH:abc>>b<<BICHON_DETACH_HASH:def>>c<<BICHON_DETACH_HASH:abc>>";
+        assert_eq!(super::placeholder_hashes(eml), vec!["abc", "def"]);
+        assert!(super::placeholder_hashes(b"no placeholders").is_empty());
+        assert!(super::placeholder_hashes(b"<<BICHON_DETACH_HASH:unterminated").is_empty());
+    }
 
     #[test]
     fn test_various_html_with_overflow_enabled() {
