@@ -65,6 +65,48 @@ async fn get_dashboard_stats_returns_data() {
 }
 
 #[tokio::test]
+async fn blob_integrity_requires_admin_authentication() {
+    setup().await;
+    let route = build_api_route();
+    let cli = api_client(route);
+    let resp = cli.get("/api/v1/blob-integrity?page=1&page_size=1").send().await;
+    assert!(resp.0.status().is_client_error());
+}
+
+#[tokio::test]
+async fn blob_integrity_rejects_unbounded_page_size() {
+    setup().await;
+    let token = admin_token().await;
+    let route = build_api_route();
+    let cli = api_client(route);
+    let resp = cli
+        .get("/api/v1/blob-integrity?page=1&page_size=1001")
+        .header("Authorization", &format!("Bearer {}", token))
+        .send()
+        .await;
+    assert!(resp.0.status().is_client_error());
+}
+
+#[tokio::test]
+async fn blob_integrity_returns_bounded_aggregate_page() {
+    setup().await;
+    let token = admin_token().await;
+    let route = build_api_route();
+    let cli = api_client(route);
+    let resp = cli
+        .get("/api/v1/blob-integrity?page=1&page_size=1")
+        .header("Authorization", &format!("Bearer {}", token))
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+    let body: serde_json::Value = resp.json().await.value().deserialize();
+    assert_eq!(body["page"], 1);
+    assert_eq!(body["page_size"], 1);
+    assert_eq!(body["payload_verification_requested"], false);
+    assert_eq!(body["scan_mode"], "index_segment_bounds");
+}
+
+#[tokio::test]
 async fn list_proxy_returns_array() {
     setup().await;
     let token = admin_token().await;

@@ -258,6 +258,19 @@ impl BlobManager {
         self.get(content_hash)
     }
 
+    /// Probe attachment storage without fetching the attachment or contacting
+    /// IMAP. This is used by the bounded admin integrity endpoint.
+    pub fn probe_attachment(
+        &self,
+        content_hash: &str,
+        verify_payload: bool,
+    ) -> BichonResult<bichon_blob::engine::ProbeResult> {
+        let key = hex_to_key(content_hash)?;
+        self.engine
+            .probe(&key, verify_payload)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))
+    }
+
     fn get(&self, content_hash: &str) -> BichonResult<Option<Bytes>> {
         let key = hex_to_key(content_hash)?;
         self.engine

@@ -26,16 +26,116 @@ use bichon_core::raise_error;
 use bichon_core::settings::cli::SETTINGS;
 use bichon_core::settings::proxy::{Proxy, ProxyTestResult};
 use bichon_core::settings::SystemConfigurations;
+use bichon_core::message::search::{AttachmentSearchFilter, SortBy};
+use bichon_core::store::blob::BLOB_MANAGER;
+use bichon_core::store::tantivy::attachment::ATTACHMENT_MANAGER;
 use bichon_core::users::permissions::Permission;
 use bichon_core::version::{fetch_notifications, Notifications};
-use poem_openapi::param::Path;
+use poem_openapi::param::{Path, Query};
 use poem_openapi::payload::{Json, PlainText};
 use poem_openapi::OpenApi;
+use serde::Serialize;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Default, Serialize, poem_openapi::Object)]
+pub struct BlobIntegrityPage {
+    pub page: u64,
+    pub page_size: u64,
+    pub total_items: u64,
+    pub total_pages: u64,
+    pub references_scanned: u64,
+    pub distinct_hashes_scanned: u64,
+    pub indexed_missing: u64,
+    pub segment_missing: u64,
+    pub bounds_invalid: u64,
+    pub payload_verified: u64,
+    pub payload_failed: u64,
+    pub payload_verification_requested: bool,
+    pub scan_mode: String,
+}
 
 pub struct SystemApi;
 
 #[OpenApi(prefix_path = "/api/v1", tag = "ApiTags::System")]
 impl SystemApi {
+    /// Bounded, read-only blob integrity check for administrators.
+    ///
+    /// The default mode checks only the attachment index and segment bounds;
+    /// it never contacts IMAP and never returns blob data. `verify_payload`
+    /// optionally validates the selected page's compressed payloads, bounded
+    /// by the page-size limit.
+    #[oai(
+        method = "get",
+        path = "/blob-integrity",
+        operation_id = "get_blob_integrity"
+    )]
+    async fn get_blob_integrity(
+        &self,
+        page: Query<Option<u64>>,
+        page_size: Query<Option<u64>>,
+        verify_payload: Query<Option<bool>>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<BlobIntegrityPage>> {
+        context.require_permission(None, Permission::USER_MANAGE)?;
+        let page = page.0.unwrap_or(1);
+        let page_size = page_size.0.unwrap_or(100);
+        if page == 0 || page_size == 0 || page_size > 1000 {
+            return Err(raise_error!(
+                "page must be >= 1 and page_size must be between 1 and 1000".into(),
+                ErrorCode::InvalidParameter
+            ).into());
+        }
+        let verify_payload = verify_payload.0.unwrap_or(false);
+        let data = ATTACHMENT_MANAGER.search(
+            None,
+            AttachmentSearchFilter::default(),
+            page,
+            page_size,
+            true,
+            SortBy::DATE,
+        )?;
+        let mut probes = HashMap::new();
+        let mut out = BlobIntegrityPage {
+            page,
+            page_size,
+            total_items: data.total_items,
+            total_pages: data.total_pages.unwrap_or(0),
+            payload_verification_requested: verify_payload,
+            scan_mode: if verify_payload {
+                "index_segment_bounds_payload".into()
+            } else {
+                "index_segment_bounds".into()
+            },
+            ..Default::default()
+        };
+        for attachment in data.items {
+            out.references_scanned += 1;
+            if !probes.contains_key(&attachment.content_hash) {
+                probes.insert(
+                    attachment.content_hash.clone(),
+                    BLOB_MANAGER.probe_attachment(&attachment.content_hash, verify_payload)?,
+                );
+            }
+        }
+        out.distinct_hashes_scanned = probes.len() as u64;
+        for probe in probes.values() {
+            if !probe.indexed {
+                out.indexed_missing += 1;
+            } else if !probe.segment_present {
+                out.segment_missing += 1;
+            } else if !probe.bounds_valid {
+                out.bounds_invalid += 1;
+            } else if verify_payload {
+                if probe.payload_verified {
+                    out.payload_verified += 1;
+                } else {
+                    out.payload_failed += 1;
+                }
+            }
+        }
+        Ok(Json(out))
+    }
+
     /// Retrieves important system notifications for the Bichon service.
     ///
     /// This endpoint returns a consolidated view of all critical system notifications including:
