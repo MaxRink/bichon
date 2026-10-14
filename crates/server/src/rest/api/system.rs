@@ -82,6 +82,7 @@ impl SystemApi {
         page: Query<Option<u64>>,
         page_size: Query<Option<u64>>,
         verify_payload: Query<Option<bool>>,
+        aggregate: Query<Option<bool>>,
         context: WrappedContext,
     ) -> ApiResult<Json<BlobIntegrityPage>> {
         context.require_permission(None, Permission::USER_MANAGE)?;
@@ -95,6 +96,7 @@ impl SystemApi {
             .into());
         }
         let verify_payload = verify_payload.0.unwrap_or(false);
+        let aggregate = aggregate.0.unwrap_or(false);
         if verify_payload && page_size > MAX_PAYLOAD_VERIFY_PAGE_SIZE {
             return Err(raise_error!(
                 format!(
@@ -103,6 +105,81 @@ impl SystemApi {
                 ErrorCode::InvalidParameter
             )
             .into());
+        }
+        if aggregate {
+            if page != 1 {
+                return Err(raise_error!(
+                    "aggregate scans must start at page 1".into(),
+                    ErrorCode::InvalidParameter
+                ).into());
+            }
+            let first = ATTACHMENT_MANAGER.search(
+                None,
+                AttachmentSearchFilter::default(),
+                1,
+                page_size,
+                true,
+                SortBy::DATE,
+            )?;
+            let total_pages = first.total_pages.unwrap_or(0);
+            let mut probe_inputs: HashMap<String, (u64, u64, u64)> = HashMap::new();
+            let mut references_scanned = 0u64;
+            for current_page in 1..=total_pages {
+                let data = if current_page == 1 {
+                    first.clone()
+                } else {
+                    ATTACHMENT_MANAGER.search(
+                        None,
+                        AttachmentSearchFilter::default(),
+                        current_page,
+                        page_size,
+                        true,
+                        SortBy::DATE,
+                    )?
+                };
+                for attachment in data.items {
+                    references_scanned += 1;
+                    let entry = probe_inputs.entry(attachment.content_hash).or_insert((attachment.size, 0, 0));
+                    if attachment.is_message { entry.1 += 1; } else { entry.2 += 1; }
+                }
+            }
+            if verify_payload {
+                let total_bytes = probe_inputs.values().try_fold(0u64, |total, (size, _, _)| total.checked_add(*size)).ok_or_else(|| {
+                    raise_error!("payload verification size exceeds the supported limit".into(), ErrorCode::InvalidParameter)
+                })?;
+                if total_bytes > MAX_PAYLOAD_VERIFY_BYTES {
+                    return Err(raise_error!(format!("payload verification is limited to {MAX_PAYLOAD_VERIFY_BYTES} bytes per page"), ErrorCode::InvalidParameter).into());
+                }
+            }
+            let mut out = BlobIntegrityPage {
+                page: 1,
+                page_size,
+                total_items: first.total_items,
+                total_pages,
+                references_scanned,
+                distinct_hashes_scanned: probe_inputs.len() as u64,
+                payload_verification_requested: verify_payload,
+                scan_mode: if verify_payload { "global_index_segment_bounds_payload".into() } else { "global_index_segment_bounds".into() },
+                ..Default::default()
+            };
+            for (content_hash, (_, message_refs, attachment_refs)) in &probe_inputs {
+                let probe = BLOB_MANAGER.probe_attachment(content_hash, verify_payload)?;
+                if !probe.indexed {
+                    out.indexed_missing += 1;
+                    out.missing_message_references += *message_refs;
+                    out.missing_attachment_references += *attachment_refs;
+                    match (*message_refs > 0, *attachment_refs > 0) {
+                        (true, true) => out.missing_shared_hashes += 1,
+                        (true, false) => out.missing_message_hashes += 1,
+                        (false, true) => out.missing_attachment_hashes += 1,
+                        (false, false) => unreachable!("probe has no references"),
+                    }
+                } else if !probe.segment_present { out.segment_missing += 1;
+                } else if !probe.bounds_valid { out.bounds_invalid += 1;
+                } else if verify_payload && probe.payload_verified { out.payload_verified += 1;
+                } else if verify_payload { out.payload_failed += 1; }
+            }
+            return Ok(Json(out));
         }
         let data = ATTACHMENT_MANAGER.search(
             None,
