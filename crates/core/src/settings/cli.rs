@@ -352,6 +352,18 @@ pub struct Settings {
     )]
     pub bichon_oidc_default_role_id: u64,
 
+    /// Immutable native user ID that may receive the explicitly configured
+    /// OIDC identity. This is intentionally opt-in: verified email alone
+    /// must never silently take over an existing local account.
+    #[clap(long, env, help = "Native user ID allowed to receive the configured OIDC identity")]
+    pub bichon_oidc_link_user_id: Option<u64>,
+
+    /// Exact email claim required when linking the configured native user.
+    /// Both this value and `bichon_oidc_link_user_id` must be set together.
+    #[clap(long, env, help = "Exact OIDC email required for the explicit native-user link")]
+    pub bichon_oidc_link_email: Option<String>,
+
+
     /// When enabled and OIDC is configured, the sign-in page automatically
     /// redirects the browser to the OIDC provider instead of showing the
     /// username/password form. Users can still reach the local login by

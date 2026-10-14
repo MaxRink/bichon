@@ -134,6 +134,8 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
         email,
         display_name,
         SETTINGS.bichon_oidc_default_role_id,
+        SETTINGS.bichon_oidc_link_user_id,
+        SETTINGS.bichon_oidc_link_email.as_deref(),
     ) {
         Ok(u) => u,
         Err(e) => {

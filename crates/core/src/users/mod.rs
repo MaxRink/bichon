@@ -29,7 +29,7 @@ use crate::{
         acl::AccessControl,
         payload::{UserCreateRequest, UserUpdateRequest},
         permissions::Permission,
-        role::{UserRole, DEFAULT_ADMIN_ROLE_ID},
+        role::{UserRole, DEFAULT_ADMIN_ROLE_ID, DEFAULT_MEMBER_ROLE_ID},
         view::UserView,
     },
     utc_now,
@@ -105,6 +105,65 @@ fn allocate_unique_username(base: &str) -> BichonResult<String> {
         "Failed to allocate a unique username for auto-provisioned OIDC user".into(),
         ErrorCode::InternalError
     ))
+}
+
+fn normalized_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+fn explicit_link_matches_claim(claim_email: &str, configured_email: &str) -> bool {
+    normalized_email(claim_email) == normalized_email(configured_email)
+}
+
+fn validate_explicit_oidc_link(
+    email: &str,
+    link_email: Option<&str>,
+    target: Option<&UserModel>,
+    provider: &str,
+    subject: &str,
+) -> BichonResult<()> {
+    let link_email = link_email.ok_or_else(|| {
+        raise_error!(
+            "OIDC native-user linking requires both a user ID and email".into(),
+            ErrorCode::InvalidParameter
+        )
+    })?;
+    if normalized_email(email) != normalized_email(link_email) {
+        return Err(raise_error!(
+            "OIDC email does not match the explicitly configured native-user link".into(),
+            ErrorCode::PermissionDenied
+        ));
+    }
+    let target = target.ok_or_else(|| {
+        raise_error!(
+            "Configured OIDC link target native user was not found".into(),
+            ErrorCode::ResourceNotFound
+        )
+    })?;
+    if target.sso_provider.is_some() || target.sso_id.is_some() {
+        if target.sso_provider.as_deref() != Some(provider)
+            || target.sso_id.as_deref() != Some(subject)
+        {
+            return Err(raise_error!(
+                "Native user already has a different SSO identity".into(),
+                ErrorCode::PermissionDenied
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_empty_sso_placeholder(user: &UserModel) -> bool {
+    user.password.is_none()
+        && user.account_access_map.is_empty()
+        && user
+            .global_roles
+            .iter()
+            .all(|role| *role == DEFAULT_MEMBER_ROLE_ID)
+        && user.acl.is_none()
+        && user.totp_secret.is_none()
+        && !user.totp_enabled
+        && user.totp_recovery_codes.is_empty()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -587,15 +646,127 @@ impl BichonUserV2 {
         email: &str,
         display_name: Option<&str>,
         default_role_id: u64,
+        explicit_link_user_id: Option<u64>,
+        explicit_link_email: Option<&str>,
     ) -> BichonResult<UserModel> {
         let subject_owned = subject.to_string();
         let provider_owned = provider.to_string();
+        let link_config = match (explicit_link_user_id, explicit_link_email) {
+            (Some(id), Some(link_email)) => Some((id, link_email)),
+            (None, None) => None,
+            _ => {
+                return Err(raise_error!(
+                    "OIDC native-user linking requires both a user ID and email".into(),
+                    ErrorCode::InvalidParameter
+                ));
+            }
+        };
+        let link_is_active = link_config
+            .map(|(_, link_email)| explicit_link_matches_claim(email, link_email))
+            .unwrap_or(false);
 
         let matches_by_sso = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
             u.sso_id.as_deref() == Some(&subject_owned)
                 && u.sso_provider.as_deref() == Some(&provider_owned)
         })?;
-        if let Some(user) = matches_by_sso.into_iter().next() {
+        if let Some(mut user) = matches_by_sso.into_iter().next() {
+            if link_config.map(|(id, _)| id) == Some(user.id) {
+                if !link_is_active {
+                    return Err(raise_error!(
+                        "OIDC subject is bound to the native link target but the verified email does not match".into(),
+                        ErrorCode::PermissionDenied
+                    ));
+                }
+                validate_explicit_oidc_link(
+                    email,
+                    explicit_link_email,
+                    Some(&user),
+                    provider,
+                    subject,
+                )?;
+                return Ok(user);
+            }
+            if link_is_active {
+                let (target_id, link_email) = link_config.expect("active OIDC link configuration");
+                let target = find_impl::<UserModel>(DB_MANAGER.db(), &target_id.to_string())?;
+                validate_explicit_oidc_link(
+                    email,
+                    Some(link_email),
+                    target.as_ref(),
+                    provider,
+                    subject,
+                )?;
+                if !is_empty_sso_placeholder(&user) {
+                    return Err(raise_error!(
+                        "Existing OIDC identity is bound to a non-empty native user; refusing reassignment".into(),
+                        ErrorCode::PermissionDenied
+                    ));
+                }
+                user.sso_provider = None;
+                user.sso_id = None;
+                user.updated_at = utc_now!();
+                let expected_provider = provider.to_string();
+                let expected_subject = subject.to_string();
+                update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
+                    if current.sso_provider.as_deref() != Some(&expected_provider)
+                        || current.sso_id.as_deref() != Some(&expected_subject)
+                        || !is_empty_sso_placeholder(&current)
+                    {
+                        return Err(raise_error!(
+                            "Existing OIDC placeholder changed; refusing reassignment".into(),
+                            ErrorCode::PermissionDenied
+                        ));
+                    }
+                    current.sso_provider = None;
+                    current.sso_id = None;
+                    current.updated_at = utc_now!();
+                    Ok(current)
+                })?;
+            } else {
+                return Ok(user);
+            }
+        }
+
+        // Linking a verified OIDC identity to a native account is a privileged
+        // deployment decision. Require both an immutable native ID and the
+        // exact configured email claim; never fall back to an arbitrary
+        // same-email takeover. A conflicting existing identity is rejected.
+        if link_is_active {
+            let (user_id, link_email) = link_config.expect("active OIDC link configuration");
+            let user = find_impl::<UserModel>(DB_MANAGER.db(), &user_id.to_string())?;
+            validate_explicit_oidc_link(
+                email,
+                Some(link_email),
+                user.as_ref(),
+                provider,
+                subject,
+            )?;
+            let mut user = user.expect("validated explicit OIDC link target");
+            if user.sso_provider.is_some() || user.sso_id.is_some() {
+                return Ok(user);
+            }
+            user.sso_provider = Some(provider.to_string());
+            user.sso_id = Some(subject.to_string());
+            user.updated_at = utc_now!();
+            let expected_provider = provider.to_string();
+            let expected_subject = subject.to_string();
+            update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
+                if current.sso_provider.is_some() || current.sso_id.is_some() {
+                    if current.sso_provider.as_deref() != Some(&expected_provider)
+                        || current.sso_id.as_deref() != Some(&expected_subject)
+                    {
+                        return Err(raise_error!(
+                            "Native user already has a different SSO identity".into(),
+                            ErrorCode::PermissionDenied
+                        ));
+                    }
+                    return Ok(current);
+                }
+                current.sso_provider = Some(expected_provider);
+                current.sso_id = Some(expected_subject);
+                current.updated_at = utc_now!();
+                Ok(current)
+            })?;
             return Ok(user);
         }
 
@@ -607,9 +778,13 @@ impl BichonUserV2 {
             user.sso_id = Some(subject.to_string());
             user.sso_provider = Some(provider.to_string());
             user.updated_at = now;
-            let user_clone = user.clone();
-            update_impl(DB_MANAGER.db(), &user.id.to_string(), move |_current: UserModel| {
-                Ok(user_clone.clone())
+            let provider = provider.to_string();
+            let subject = subject.to_string();
+            update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
+                current.sso_id = Some(subject);
+                current.sso_provider = Some(provider);
+                current.updated_at = utc_now!();
+                Ok(current)
             })?;
             return Ok(user);
         }
@@ -1048,6 +1223,115 @@ mod tests {
             global_roles,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn explicit_oidc_link_email_comparison_is_case_insensitive_and_trimmed() {
+        assert_eq!(
+            normalized_email("  Admin@Example.COM "),
+            normalized_email("admin@example.com")
+        );
+        assert_ne!(
+            normalized_email("admin@example.com"),
+            normalized_email("other@example.com")
+        );
+        assert!(explicit_link_matches_claim(
+            "admin@example.com",
+            " Admin@Example.COM "
+        ));
+        assert!(!explicit_link_matches_claim(
+            "charlotte@example.com",
+            "admin@example.com"
+        ));
+    }
+
+    fn link_target(email: &str) -> UserModel {
+        UserModel {
+            id: 42,
+            email: email.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_oidc_link_accepts_matching_target_without_changing_roles() {
+        let target = link_target("admin@example.com");
+        assert!(validate_explicit_oidc_link(
+            " Admin@Example.COM ",
+            Some("admin@example.com"),
+            Some(&target),
+            "oidc",
+            "subject-1"
+        )
+        .is_ok());
+        assert!(target.global_roles.is_empty());
+    }
+
+    #[test]
+    fn explicit_oidc_link_rejects_wrong_email() {
+        let target = link_target("admin@example.com");
+        assert!(validate_explicit_oidc_link(
+            "other@example.com",
+            Some("admin@example.com"),
+            Some(&target),
+            "oidc",
+            "subject-1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_oidc_link_rejects_incomplete_configuration() {
+        let target = link_target("admin@example.com");
+        assert!(validate_explicit_oidc_link(
+            "admin@example.com",
+            None,
+            Some(&target),
+            "oidc",
+            "subject-1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_oidc_link_rejects_missing_target() {
+        assert!(validate_explicit_oidc_link(
+            "admin@example.com",
+            Some("admin@example.com"),
+            None,
+            "oidc",
+            "subject-1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_oidc_link_rejects_conflicting_sso_identity() {
+        let mut target = link_target("admin@example.com");
+        target.sso_provider = Some("other".to_string());
+        target.sso_id = Some("different-subject".to_string());
+        assert!(validate_explicit_oidc_link(
+            "admin@example.com",
+            Some("admin@example.com"),
+            Some(&target),
+            "oidc",
+            "subject-1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn only_an_empty_placeholder_can_be_reassigned() {
+        let empty = link_target("admin@example.com");
+        assert!(is_empty_sso_placeholder(&empty));
+
+        let mut with_role = empty.clone();
+        with_role.global_roles.push(1);
+        assert!(!is_empty_sso_placeholder(&with_role));
+
+        let mut with_mailbox = empty;
+        with_mailbox.account_access_map.insert(7, 8);
+        assert!(!is_empty_sso_placeholder(&with_mailbox));
     }
 
     /// The trap this field invites: `utc_now!()` is *milliseconds*, so an
