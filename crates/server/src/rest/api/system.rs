@@ -41,6 +41,14 @@ const MAX_PAYLOAD_VERIFY_PAGE_SIZE: u64 = 100;
 const MAX_PAYLOAD_VERIFY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, poem_openapi::Object)]
+pub struct BlobIntegrityReference {
+    pub account_id: u64,
+    pub envelope_id: String,
+    pub mailbox_id: u64,
+    pub is_message: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, poem_openapi::Object)]
 pub struct BlobIntegrityPage {
     pub page: u64,
     pub page_size: u64,
@@ -60,6 +68,7 @@ pub struct BlobIntegrityPage {
     pub payload_failed: u64,
     pub payload_verification_requested: bool,
     pub scan_mode: String,
+    pub missing_references: Vec<BlobIntegrityReference>,
 }
 
 pub struct SystemApi;
@@ -83,6 +92,7 @@ impl SystemApi {
         page_size: Query<Option<u64>>,
         verify_payload: Query<Option<bool>>,
         aggregate: Query<Option<bool>>,
+        include_missing_references: Query<Option<bool>>,
         context: WrappedContext,
     ) -> ApiResult<Json<BlobIntegrityPage>> {
         context.require_permission(None, Permission::USER_MANAGE)?;
@@ -97,6 +107,7 @@ impl SystemApi {
         }
         let verify_payload = verify_payload.0.unwrap_or(false);
         let aggregate = aggregate.0.unwrap_or(false);
+        let include_missing_references = include_missing_references.0.unwrap_or(false);
         if verify_payload && page_size > MAX_PAYLOAD_VERIFY_PAGE_SIZE {
             return Err(raise_error!(
                 format!(
@@ -123,6 +134,7 @@ impl SystemApi {
             )?;
             let total_pages = first.total_pages.unwrap_or(0);
             let mut probe_inputs: HashMap<String, (u64, u64, u64)> = HashMap::new();
+            let mut reference_map: HashMap<String, Vec<BlobIntegrityReference>> = HashMap::new();
             let mut references_scanned = 0u64;
             for current_page in 1..=total_pages {
                 let data = if current_page == 1 {
@@ -139,8 +151,16 @@ impl SystemApi {
                 };
                 for attachment in data.items {
                     references_scanned += 1;
-                    let entry = probe_inputs.entry(attachment.content_hash).or_insert((attachment.size, 0, 0));
+                    let entry = probe_inputs.entry(attachment.content_hash.clone()).or_insert((attachment.size, 0, 0));
                     if attachment.is_message { entry.1 += 1; } else { entry.2 += 1; }
+                    if include_missing_references {
+                        reference_map.entry(attachment.content_hash.clone()).or_default().push(BlobIntegrityReference {
+                            account_id: attachment.account_id,
+                            envelope_id: attachment.envelope_id,
+                            mailbox_id: attachment.mailbox_id,
+                            is_message: attachment.is_message,
+                        });
+                    }
                 }
             }
             if verify_payload {
@@ -174,6 +194,9 @@ impl SystemApi {
                         (false, true) => out.missing_attachment_hashes += 1,
                         (false, false) => unreachable!("probe has no references"),
                     }
+                    if include_missing_references {
+                        out.missing_references.extend(reference_map.get(content_hash).cloned().unwrap_or_default());
+                    }
                 } else if !probe.segment_present { out.segment_missing += 1;
                 } else if !probe.bounds_valid { out.bounds_invalid += 1;
                 } else if verify_payload && probe.payload_verified { out.payload_verified += 1;
@@ -190,6 +213,7 @@ impl SystemApi {
             SortBy::DATE,
         )?;
         let mut probe_inputs: HashMap<String, (u64, u64, u64)> = HashMap::new();
+        let mut reference_map: HashMap<String, Vec<BlobIntegrityReference>> = HashMap::new();
         let mut out = BlobIntegrityPage {
             page,
             page_size,
@@ -206,12 +230,20 @@ impl SystemApi {
         for attachment in data.items {
             out.references_scanned += 1;
             let entry = probe_inputs
-                .entry(attachment.content_hash)
+                .entry(attachment.content_hash.clone())
                 .or_insert((attachment.size, 0, 0));
             if attachment.is_message {
                 entry.1 += 1;
             } else {
                 entry.2 += 1;
+            }
+            if include_missing_references {
+                reference_map.entry(attachment.content_hash.clone()).or_default().push(BlobIntegrityReference {
+                    account_id: attachment.account_id,
+                    envelope_id: attachment.envelope_id,
+                    mailbox_id: attachment.mailbox_id,
+                    is_message: attachment.is_message,
+                });
             }
         }
         if verify_payload {
@@ -256,6 +288,9 @@ impl SystemApi {
                     (true, false) => out.missing_message_hashes += 1,
                     (false, true) => out.missing_attachment_hashes += 1,
                     (false, false) => unreachable!("probe has no references"),
+                }
+                if include_missing_references {
+                    out.missing_references.extend(reference_map.get(content_hash).cloned().unwrap_or_default());
                 }
             } else if !probe.segment_present {
                 out.segment_missing += 1;
