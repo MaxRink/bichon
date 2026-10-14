@@ -69,7 +69,10 @@ async fn blob_integrity_requires_admin_authentication() {
     setup().await;
     let route = build_api_route();
     let cli = api_client(route);
-    let resp = cli.get("/api/v1/blob-integrity?page=1&page_size=1").send().await;
+    let resp = cli
+        .get("/api/v1/blob-integrity?page=1&page_size=1")
+        .send()
+        .await;
     assert!(resp.0.status().is_client_error());
 }
 
@@ -81,6 +84,20 @@ async fn blob_integrity_rejects_unbounded_page_size() {
     let cli = api_client(route);
     let resp = cli
         .get("/api/v1/blob-integrity?page=1&page_size=1001")
+        .header("Authorization", &format!("Bearer {}", token))
+        .send()
+        .await;
+    assert!(resp.0.status().is_client_error());
+}
+
+#[tokio::test]
+async fn blob_integrity_rejects_unbounded_payload_page_size() {
+    setup().await;
+    let token = admin_token().await;
+    let route = build_api_route();
+    let cli = api_client(route);
+    let resp = cli
+        .get("/api/v1/blob-integrity?page=1&page_size=101&verify_payload=true")
         .header("Authorization", &format!("Bearer {}", token))
         .send()
         .await;

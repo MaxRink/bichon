@@ -17,25 +17,28 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::common::auth::WrappedContext;
-use crate::rest::api::ApiTags;
 use crate::rest::ApiResult;
+use crate::rest::api::ApiTags;
 use bichon_core::dashboard::DashboardStats;
 use bichon_core::error::code::ErrorCode;
-use bichon_core::ext::event_bus::{emit, Event};
+use bichon_core::ext::event_bus::{Event, emit};
+use bichon_core::message::search::{AttachmentSearchFilter, SortBy};
 use bichon_core::raise_error;
+use bichon_core::settings::SystemConfigurations;
 use bichon_core::settings::cli::SETTINGS;
 use bichon_core::settings::proxy::{Proxy, ProxyTestResult};
-use bichon_core::settings::SystemConfigurations;
-use bichon_core::message::search::{AttachmentSearchFilter, SortBy};
 use bichon_core::store::blob::BLOB_MANAGER;
 use bichon_core::store::tantivy::attachment::ATTACHMENT_MANAGER;
 use bichon_core::users::permissions::Permission;
-use bichon_core::version::{fetch_notifications, Notifications};
+use bichon_core::version::{Notifications, fetch_notifications};
+use poem_openapi::OpenApi;
 use poem_openapi::param::{Path, Query};
 use poem_openapi::payload::{Json, PlainText};
-use poem_openapi::OpenApi;
 use serde::Serialize;
 use std::collections::HashMap;
+
+const MAX_PAYLOAD_VERIFY_PAGE_SIZE: u64 = 100;
+const MAX_PAYLOAD_VERIFY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, poem_openapi::Object)]
 pub struct BlobIntegrityPage {
@@ -83,9 +86,19 @@ impl SystemApi {
             return Err(raise_error!(
                 "page must be >= 1 and page_size must be between 1 and 1000".into(),
                 ErrorCode::InvalidParameter
-            ).into());
+            )
+            .into());
         }
         let verify_payload = verify_payload.0.unwrap_or(false);
+        if verify_payload && page_size > MAX_PAYLOAD_VERIFY_PAGE_SIZE {
+            return Err(raise_error!(
+                format!(
+                    "payload verification page_size must be at most {MAX_PAYLOAD_VERIFY_PAGE_SIZE}"
+                ),
+                ErrorCode::InvalidParameter
+            )
+            .into());
+        }
         let data = ATTACHMENT_MANAGER.search(
             None,
             AttachmentSearchFilter::default(),
@@ -94,7 +107,7 @@ impl SystemApi {
             true,
             SortBy::DATE,
         )?;
-        let mut probes = HashMap::new();
+        let mut probe_sizes = HashMap::new();
         let mut out = BlobIntegrityPage {
             page,
             page_size,
@@ -110,12 +123,33 @@ impl SystemApi {
         };
         for attachment in data.items {
             out.references_scanned += 1;
-            if !probes.contains_key(&attachment.content_hash) {
-                probes.insert(
-                    attachment.content_hash.clone(),
-                    BLOB_MANAGER.probe_attachment(&attachment.content_hash, verify_payload)?,
-                );
+            probe_sizes
+                .entry(attachment.content_hash)
+                .or_insert(attachment.size);
+        }
+        if verify_payload {
+            let total_bytes = probe_sizes
+                .values()
+                .try_fold(0u64, |total, size| total.checked_add(*size))
+                .ok_or_else(|| {
+                    raise_error!(
+                        "payload verification size exceeds the supported limit".into(),
+                        ErrorCode::InvalidParameter
+                    )
+                })?;
+            if total_bytes > MAX_PAYLOAD_VERIFY_BYTES {
+                return Err(raise_error!(
+                    format!("payload verification is limited to {MAX_PAYLOAD_VERIFY_BYTES} bytes per page"),
+                    ErrorCode::InvalidParameter
+                ).into());
             }
+        }
+        let mut probes = HashMap::new();
+        for content_hash in probe_sizes.keys() {
+            probes.insert(
+                content_hash.clone(),
+                BLOB_MANAGER.probe_attachment(content_hash, verify_payload)?,
+            );
         }
         out.distinct_hashes_scanned = probes.len() as u64;
         for probe in probes.values() {
