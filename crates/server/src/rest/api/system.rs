@@ -45,6 +45,8 @@ pub struct BlobIntegrityReference {
     pub account_id: u64,
     pub envelope_id: String,
     pub mailbox_id: u64,
+    pub mailbox_name: Option<String>,
+    pub content_hash: String,
     pub is_message: bool,
 }
 
@@ -158,6 +160,8 @@ impl SystemApi {
                             account_id: attachment.account_id,
                             envelope_id: attachment.envelope_id,
                             mailbox_id: attachment.mailbox_id,
+                            mailbox_name: attachment.mailbox_name,
+                            content_hash: attachment.content_hash.clone(),
                             is_message: attachment.is_message,
                         });
                     }
@@ -242,6 +246,8 @@ impl SystemApi {
                     account_id: attachment.account_id,
                     envelope_id: attachment.envelope_id,
                     mailbox_id: attachment.mailbox_id,
+                    mailbox_name: attachment.mailbox_name,
+                    content_hash: attachment.content_hash.clone(),
                     is_message: attachment.is_message,
                 });
             }
