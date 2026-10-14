@@ -121,6 +121,9 @@ async fn blob_integrity_returns_bounded_aggregate_page() {
     assert_eq!(body["page_size"], 1);
     assert_eq!(body["payload_verification_requested"], false);
     assert_eq!(body["scan_mode"], "index_segment_bounds");
+    assert!(body.get("missing_message_hashes").is_some());
+    assert!(body.get("missing_attachment_hashes").is_some());
+    assert!(body.get("missing_shared_hashes").is_some());
 }
 
 #[tokio::test]

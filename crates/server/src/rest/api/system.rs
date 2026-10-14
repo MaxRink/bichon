@@ -49,6 +49,11 @@ pub struct BlobIntegrityPage {
     pub references_scanned: u64,
     pub distinct_hashes_scanned: u64,
     pub indexed_missing: u64,
+    pub missing_message_hashes: u64,
+    pub missing_attachment_hashes: u64,
+    pub missing_shared_hashes: u64,
+    pub missing_message_references: u64,
+    pub missing_attachment_references: u64,
     pub segment_missing: u64,
     pub bounds_invalid: u64,
     pub payload_verified: u64,
@@ -107,7 +112,7 @@ impl SystemApi {
             true,
             SortBy::DATE,
         )?;
-        let mut probe_sizes = HashMap::new();
+        let mut probe_inputs: HashMap<String, (u64, u64, u64)> = HashMap::new();
         let mut out = BlobIntegrityPage {
             page,
             page_size,
@@ -123,14 +128,19 @@ impl SystemApi {
         };
         for attachment in data.items {
             out.references_scanned += 1;
-            probe_sizes
+            let entry = probe_inputs
                 .entry(attachment.content_hash)
-                .or_insert(attachment.size);
+                .or_insert((attachment.size, 0, 0));
+            if attachment.is_message {
+                entry.1 += 1;
+            } else {
+                entry.2 += 1;
+            }
         }
         if verify_payload {
-            let total_bytes = probe_sizes
+            let total_bytes = probe_inputs
                 .values()
-                .try_fold(0u64, |total, size| total.checked_add(*size))
+                .try_fold(0u64, |total, (size, _, _)| total.checked_add(*size))
                 .ok_or_else(|| {
                     raise_error!(
                         "payload verification size exceeds the supported limit".into(),
@@ -145,16 +155,31 @@ impl SystemApi {
             }
         }
         let mut probes = HashMap::new();
-        for content_hash in probe_sizes.keys() {
+        for content_hash in probe_inputs.keys() {
             probes.insert(
                 content_hash.clone(),
                 BLOB_MANAGER.probe_attachment(content_hash, verify_payload)?,
             );
         }
         out.distinct_hashes_scanned = probes.len() as u64;
-        for probe in probes.values() {
+        for (content_hash, probe) in &probes {
             if !probe.indexed {
                 out.indexed_missing += 1;
+                let (_, message_refs, attachment_refs) = probe_inputs
+                    .get(content_hash)
+                    .expect("probe input exists for every probe");
+                if *message_refs > 0 {
+                    out.missing_message_references += *message_refs;
+                }
+                if *attachment_refs > 0 {
+                    out.missing_attachment_references += *attachment_refs;
+                }
+                match (*message_refs > 0, *attachment_refs > 0) {
+                    (true, true) => out.missing_shared_hashes += 1,
+                    (true, false) => out.missing_message_hashes += 1,
+                    (false, true) => out.missing_attachment_hashes += 1,
+                    (false, false) => unreachable!("probe has no references"),
+                }
             } else if !probe.segment_present {
                 out.segment_missing += 1;
             } else if !probe.bounds_valid {
