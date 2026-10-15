@@ -1362,6 +1362,43 @@ fn diagnose_blobs(
     })
 }
 
+/// Inspects one envelope's indexed blob state without contacting IMAP or
+/// changing local storage. This is the safe preflight used by the repair API.
+pub fn inspect_envelope_blobs(
+    account_id: u64,
+    envelope_id: &str,
+) -> BichonResult<BlobRepairReport> {
+    let envelope_with_attachments = ENVELOPE_MANAGER
+        .get_envelope_by_id(account_id, envelope_id)?
+        .ok_or_else(|| {
+            raise_error!(
+                format!("Envelope not found: account_id={account_id} envelope_id={envelope_id}"),
+                ErrorCode::ResourceNotFound
+            )
+        })?;
+    let envelope = envelope_with_attachments.envelope;
+    let diagnosis = diagnose_blobs(&envelope, envelope_with_attachments.attachments.as_deref())?;
+    let status = if diagnosis.broken {
+        "repairable_candidate"
+    } else {
+        STATUS_COMPLETE
+    };
+    Ok(BlobRepairReport {
+        envelope_id: envelope_id.to_string(),
+        account_id: envelope.account_id,
+        mailbox_id: envelope.mailbox_id,
+        subject: envelope.subject,
+        message_id: envelope.message_id,
+        status: status.into(),
+        email_missing_before: diagnosis.email_missing,
+        email_missing_after: diagnosis.email_missing,
+        email_blob_missing: diagnosis.email_missing,
+        missing_after: diagnosis.unresolved.clone(),
+        missing_before: diagnosis.unresolved,
+        ..Default::default()
+    })
+}
+
 /// Content hashes referenced by `<<BICHON_DETACH_HASH:...>>` placeholders in a
 /// detached EML.
 fn placeholder_hashes(detached_eml: &[u8]) -> Vec<String> {

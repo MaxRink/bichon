@@ -21,7 +21,9 @@ use crate::rest::api::ApiTags;
 use crate::rest::ApiResult;
 use bichon_core::account::migration::AccountModel;
 use bichon_core::common::paginated::DataPage;
-use bichon_core::envelope::extractor::{repair_envelope_blobs, BlobRepairReport};
+use bichon_core::envelope::extractor::{
+    inspect_envelope_blobs, repair_envelope_blobs, BlobRepairReport,
+};
 use bichon_core::envelope::repair::BlobRepairRecord;
 use bichon_core::error::code::ErrorCode;
 use bichon_core::message::append::restore_emails;
@@ -315,11 +317,16 @@ impl MessageApi {
         account_id: Path<u64>,
         /// The ID of the message to repair.
         envelope_id: Path<String>,
+        /// Inspect missing blobs without contacting IMAP or writing storage.
+        dry_run: Query<Option<bool>>,
         context: WrappedContext,
     ) -> ApiResult<Json<BlobRepairReport>> {
         let account_id = account_id.0;
         AccountModel::check_account_exists(account_id)?;
         context.require_permission(Some(account_id), Permission::DATA_MANAGE)?;
+        if dry_run.0.unwrap_or(false) {
+            return Ok(Json(inspect_envelope_blobs(account_id, &envelope_id.0)?));
+        }
         let report = repair_envelope_blobs(account_id, &envelope_id.0).await?;
         // Audited before the history record: `emit` is fire-and-forget, while
         // the persist below can fail, and a repair that is missing from the
