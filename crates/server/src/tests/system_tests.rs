@@ -142,10 +142,7 @@ async fn blob_integrity_missing_references_are_bounded_and_serialized() {
     let references = body["missing_references"]
         .as_array()
         .expect("missing_references must be an array");
-    assert!(
-        references.len() <= 1000,
-        "reference output must remain bounded for a one-item page"
-    );
+    assert!(references.len() <= 1000);
     for reference in references {
         assert!(reference["content_hash"].as_str().is_some());
         assert!(reference["is_message"].is_boolean());
