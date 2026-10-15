@@ -41,7 +41,9 @@ async fn get_system_configurations() {
         .header("Authorization", &format!("Bearer {}", token))
         .send()
         .await;
-    resp.assert_status_is_ok();
+    if !resp.0.status().is_success() {
+        panic!("integrity request failed: {}", resp.text().await.value());
+    }
 }
 
 #[tokio::test]
@@ -126,7 +128,7 @@ async fn blob_integrity_returns_bounded_aggregate_page() {
     assert!(body.get("missing_shared_hashes").is_some());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blob_integrity_missing_references_are_bounded_and_serialized() {
     setup().await;
     let token = admin_token().await;
