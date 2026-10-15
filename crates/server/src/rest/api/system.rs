@@ -17,23 +17,24 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::common::auth::WrappedContext;
-use crate::rest::ApiResult;
 use crate::rest::api::ApiTags;
+use crate::rest::ApiResult;
 use bichon_core::dashboard::DashboardStats;
 use bichon_core::error::code::ErrorCode;
-use bichon_core::ext::event_bus::{Event, emit};
+use bichon_core::ext::event_bus::{emit, Event};
 use bichon_core::message::search::{AttachmentSearchFilter, SortBy};
 use bichon_core::raise_error;
-use bichon_core::settings::SystemConfigurations;
 use bichon_core::settings::cli::SETTINGS;
 use bichon_core::settings::proxy::{Proxy, ProxyTestResult};
+use bichon_core::settings::SystemConfigurations;
 use bichon_core::store::blob::BLOB_MANAGER;
 use bichon_core::store::tantivy::attachment::ATTACHMENT_MANAGER;
+use bichon_core::store::tantivy::model::AttachmentModel;
 use bichon_core::users::permissions::Permission;
-use bichon_core::version::{Notifications, fetch_notifications};
-use poem_openapi::OpenApi;
+use bichon_core::version::{fetch_notifications, Notifications};
 use poem_openapi::param::{Path, Query};
 use poem_openapi::payload::{Json, PlainText};
+use poem_openapi::OpenApi;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -73,7 +74,61 @@ pub struct BlobIntegrityPage {
     pub missing_references: Vec<BlobIntegrityReference>,
 }
 
+fn blob_integrity_reference(attachment: &AttachmentModel) -> BlobIntegrityReference {
+    BlobIntegrityReference {
+        account_id: attachment.account_id,
+        envelope_id: attachment.envelope_id.clone(),
+        mailbox_id: attachment.mailbox_id,
+        mailbox_name: attachment.mailbox_name.clone(),
+        content_hash: attachment.content_hash.clone(),
+        is_message: attachment.is_message,
+    }
+}
+
 pub struct SystemApi;
+
+#[cfg(test)]
+mod tests {
+    use super::blob_integrity_reference;
+    use bichon_core::store::tantivy::model::AttachmentModel;
+
+    #[test]
+    fn blob_integrity_reference_preserves_reconciliation_fields() {
+        let attachment = AttachmentModel {
+            id: "fixture".into(),
+            envelope_id: "env-42".into(),
+            account_id: 7,
+            account_email: None,
+            mailbox_id: 9,
+            mailbox_name: Some("Archive".into()),
+            subject: String::new(),
+            content_hash: "ab".repeat(32),
+            from: String::new(),
+            date: 0,
+            ingest_at: 0,
+            size: 0,
+            ext: None,
+            category: String::new(),
+            content_type: String::new(),
+            shard_id: 0,
+            text: None,
+            has_text: false,
+            is_ocr: false,
+            page_count: None,
+            is_indexed: true,
+            is_message: false,
+            name: None,
+            tags: None,
+            auto_tags: None,
+        };
+        let reference = blob_integrity_reference(&attachment);
+        assert_eq!(reference.account_id, 7);
+        assert_eq!(reference.envelope_id, "env-42");
+        assert_eq!(reference.mailbox_name.as_deref(), Some("Archive"));
+        assert_eq!(reference.content_hash, "ab".repeat(32));
+        assert!(!reference.is_message);
+    }
+}
 
 #[OpenApi(prefix_path = "/api/v1", tag = "ApiTags::System")]
 impl SystemApi {
@@ -124,7 +179,8 @@ impl SystemApi {
                 return Err(raise_error!(
                     "aggregate scans must start at page 1".into(),
                     ErrorCode::InvalidParameter
-                ).into());
+                )
+                .into());
             }
             let first = ATTACHMENT_MANAGER.search(
                 None,
@@ -153,24 +209,32 @@ impl SystemApi {
                 };
                 for attachment in data.items {
                     references_scanned += 1;
-                    let entry = probe_inputs.entry(attachment.content_hash.clone()).or_insert((attachment.size, 0, 0));
-                    if attachment.is_message { entry.1 += 1; } else { entry.2 += 1; }
+                    let entry = probe_inputs
+                        .entry(attachment.content_hash.clone())
+                        .or_insert((attachment.size, 0, 0));
+                    if attachment.is_message {
+                        entry.1 += 1;
+                    } else {
+                        entry.2 += 1;
+                    }
                     if include_missing_references {
-                        reference_map.entry(attachment.content_hash.clone()).or_default().push(BlobIntegrityReference {
-                            account_id: attachment.account_id,
-                            envelope_id: attachment.envelope_id,
-                            mailbox_id: attachment.mailbox_id,
-                            mailbox_name: attachment.mailbox_name,
-                            content_hash: attachment.content_hash.clone(),
-                            is_message: attachment.is_message,
-                        });
+                        reference_map
+                            .entry(attachment.content_hash.clone())
+                            .or_default()
+                            .push(blob_integrity_reference(&attachment));
                     }
                 }
             }
             if verify_payload {
-                let total_bytes = probe_inputs.values().try_fold(0u64, |total, (size, _, _)| total.checked_add(*size)).ok_or_else(|| {
-                    raise_error!("payload verification size exceeds the supported limit".into(), ErrorCode::InvalidParameter)
-                })?;
+                let total_bytes = probe_inputs
+                    .values()
+                    .try_fold(0u64, |total, (size, _, _)| total.checked_add(*size))
+                    .ok_or_else(|| {
+                        raise_error!(
+                            "payload verification size exceeds the supported limit".into(),
+                            ErrorCode::InvalidParameter
+                        )
+                    })?;
                 if total_bytes > MAX_PAYLOAD_VERIFY_BYTES {
                     return Err(raise_error!(format!("payload verification is limited to {MAX_PAYLOAD_VERIFY_BYTES} bytes per page"), ErrorCode::InvalidParameter).into());
                 }
@@ -183,7 +247,11 @@ impl SystemApi {
                 references_scanned,
                 distinct_hashes_scanned: probe_inputs.len() as u64,
                 payload_verification_requested: verify_payload,
-                scan_mode: if verify_payload { "global_index_segment_bounds_payload".into() } else { "global_index_segment_bounds".into() },
+                scan_mode: if verify_payload {
+                    "global_index_segment_bounds_payload".into()
+                } else {
+                    "global_index_segment_bounds".into()
+                },
                 ..Default::default()
             };
             for (content_hash, (_, message_refs, attachment_refs)) in &probe_inputs {
@@ -199,12 +267,18 @@ impl SystemApi {
                         (false, false) => unreachable!("probe has no references"),
                     }
                     if include_missing_references {
-                        out.missing_references.extend(reference_map.get(content_hash).cloned().unwrap_or_default());
+                        out.missing_references
+                            .extend(reference_map.get(content_hash).cloned().unwrap_or_default());
                     }
-                } else if !probe.segment_present { out.segment_missing += 1;
-                } else if !probe.bounds_valid { out.bounds_invalid += 1;
-                } else if verify_payload && probe.payload_verified { out.payload_verified += 1;
-                } else if verify_payload { out.payload_failed += 1; }
+                } else if !probe.segment_present {
+                    out.segment_missing += 1;
+                } else if !probe.bounds_valid {
+                    out.bounds_invalid += 1;
+                } else if verify_payload && probe.payload_verified {
+                    out.payload_verified += 1;
+                } else if verify_payload {
+                    out.payload_failed += 1;
+                }
             }
             return Ok(Json(out));
         }
@@ -242,14 +316,10 @@ impl SystemApi {
                 entry.2 += 1;
             }
             if include_missing_references {
-                reference_map.entry(attachment.content_hash.clone()).or_default().push(BlobIntegrityReference {
-                    account_id: attachment.account_id,
-                    envelope_id: attachment.envelope_id,
-                    mailbox_id: attachment.mailbox_id,
-                    mailbox_name: attachment.mailbox_name,
-                    content_hash: attachment.content_hash.clone(),
-                    is_message: attachment.is_message,
-                });
+                reference_map
+                    .entry(attachment.content_hash.clone())
+                    .or_default()
+                    .push(blob_integrity_reference(&attachment));
             }
         }
         if verify_payload {
@@ -296,7 +366,8 @@ impl SystemApi {
                     (false, false) => unreachable!("probe has no references"),
                 }
                 if include_missing_references {
-                    out.missing_references.extend(reference_map.get(content_hash).cloned().unwrap_or_default());
+                    out.missing_references
+                        .extend(reference_map.get(content_hash).cloned().unwrap_or_default());
                 }
             } else if !probe.segment_present {
                 out.segment_missing += 1;

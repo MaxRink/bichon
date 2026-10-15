@@ -41,9 +41,7 @@ async fn get_system_configurations() {
         .header("Authorization", &format!("Bearer {}", token))
         .send()
         .await;
-    if !resp.0.status().is_success() {
-        panic!("integrity request failed: {}", resp.text().await.value());
-    }
+    resp.assert_status_is_ok();
 }
 
 #[tokio::test]
