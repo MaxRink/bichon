@@ -1265,6 +1265,37 @@ mod test {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_blobs_reports_nonempty_indexed_attachment_reference() {
+        use bytes::Bytes;
+
+        let missing_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let raw = format!(
+            "Message-ID: <missing-fixture@example.test>\r\n\r\nbody\r\n<<BICHON_DETACH_HASH:{missing_hash}>>"
+        );
+        let email_hash = super::compute_content_hash(raw.as_bytes());
+        super::BLOB_MANAGER
+            .queue(super::DetachedEmail {
+                email: (email_hash.clone(), Bytes::from(raw)),
+                attachments: None,
+            })
+            .await;
+        super::BLOB_MANAGER.drain().await;
+
+        let envelope = super::Envelope {
+            content_hash: email_hash,
+            ..Default::default()
+        };
+        let attachments = vec![super::AttachmentInfo {
+            content_hash: missing_hash.into(),
+            ..Default::default()
+        }];
+        let (email_missing, missing) = super::missing_blobs(&envelope, Some(&attachments))
+            .expect("missing-reference inspection should succeed");
+        assert!(!email_missing);
+        assert_eq!(missing, vec![missing_hash]);
+    }
+
     #[test]
     fn test_various_html_with_overflow_enabled() {
         let cases = [
