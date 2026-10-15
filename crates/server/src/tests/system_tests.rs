@@ -6,6 +6,8 @@
 use poem::test::TestClient;
 use serde::Deserialize;
 
+use bichon_core::store::tantivy::{attachment::ATTACHMENT_MANAGER, model::AttachmentModel};
+
 use super::{admin_token, build_api_route, setup};
 
 fn api_client(route: impl poem::Endpoint) -> TestClient<impl poem::Endpoint> {
@@ -148,6 +150,56 @@ async fn blob_integrity_missing_references_are_bounded_and_serialized() {
         assert!(reference["is_message"].is_boolean());
         assert!(reference["envelope_id"].as_str().is_some());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_integrity_serializes_nonempty_missing_reference_fixture() {
+    setup().await;
+    let token = admin_token().await;
+    let content_hash = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    ATTACHMENT_MANAGER
+        .queue(
+            AttachmentModel {
+                id: "fixture-missing-attachment".into(),
+                envelope_id: "fixture-envelope".into(),
+                account_id: 7,
+                mailbox_id: 11,
+                subject: "fixture".into(),
+                content_hash: content_hash.into(),
+                size: 12,
+                category: "document".into(),
+                content_type: "application/octet-stream".into(),
+                ..Default::default()
+            }
+            .into_document(),
+        )
+        .await;
+    ATTACHMENT_MANAGER
+        .prepare_for_backup()
+        .await
+        .expect("fixture attachment should be indexed");
+
+    let route = build_api_route();
+    let cli = api_client(route);
+    let resp = cli
+        .get(
+            "/api/v1/blob-integrity?page=1&page_size=1000&aggregate=true&include_missing_references=true",
+        )
+        .header("Authorization", &format!("Bearer {}", token))
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+    let body: serde_json::Value = resp.json().await.value().deserialize();
+    let references = body["missing_references"]
+        .as_array()
+        .expect("missing_references must be an array");
+    let fixture = references
+        .iter()
+        .find(|reference| reference["content_hash"] == content_hash)
+        .expect("nonempty fixture must be reported as missing");
+    assert_eq!(fixture["envelope_id"], "fixture-envelope");
+    assert_eq!(fixture["account_id"], 7);
+    assert_eq!(fixture["is_message"], false);
 }
 
 #[tokio::test]
