@@ -7,6 +7,12 @@ use poem::test::TestClient;
 use serde::Deserialize;
 
 use bichon_core::store::tantivy::{attachment::ATTACHMENT_MANAGER, model::AttachmentModel};
+use bichon_core::{
+    account::migration::AccountModel,
+    account::{migration::AccountType, payload::AccountCreateRequest},
+    archive::imap::mailbox::MailBox,
+    database::{insert_impl, manager::DB_MANAGER},
+};
 
 use super::{admin_token, build_api_route, setup};
 
@@ -156,13 +162,32 @@ async fn blob_integrity_missing_references_are_bounded_and_serialized() {
 async fn blob_integrity_serializes_nonempty_missing_reference_fixture() {
     setup().await;
     let token = admin_token().await;
+    let fixture_account = AccountModel::new(
+        7,
+        AccountCreateRequest {
+            email: "blob-integrity-fixture@example.invalid".into(),
+            enabled: true,
+            account_type: AccountType::NoSync,
+            ..Default::default()
+        },
+    )
+    .expect("fixture account should be valid");
+    let fixture_account_id = fixture_account.id;
+    insert_impl(DB_MANAGER.db(), fixture_account).expect("fixture account should be indexed");
+    MailBox::batch_insert(&[MailBox {
+        id: 11,
+        account_id: fixture_account_id,
+        name: "INBOX".into(),
+        ..Default::default()
+    }])
+    .expect("fixture mailbox should be indexed");
     let content_hash = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
     ATTACHMENT_MANAGER
         .queue(
             AttachmentModel {
                 id: "fixture-missing-attachment".into(),
                 envelope_id: "fixture-envelope".into(),
-                account_id: 7,
+                account_id: fixture_account_id,
                 mailbox_id: 11,
                 subject: "fixture".into(),
                 content_hash: content_hash.into(),
@@ -182,9 +207,7 @@ async fn blob_integrity_serializes_nonempty_missing_reference_fixture() {
     let route = build_api_route();
     let cli = api_client(route);
     let resp = cli
-        .get(
-            "/api/v1/blob-integrity?page=1&page_size=1000&aggregate=true&include_missing_references=true",
-        )
+        .get("/api/v1/blob-integrity?page=1&page_size=1000&include_missing_references=true")
         .header("Authorization", &format!("Bearer {}", token))
         .send()
         .await;
@@ -198,7 +221,7 @@ async fn blob_integrity_serializes_nonempty_missing_reference_fixture() {
         .find(|reference| reference["content_hash"] == content_hash)
         .expect("nonempty fixture must be reported as missing");
     assert_eq!(fixture["envelope_id"], "fixture-envelope");
-    assert_eq!(fixture["account_id"], 7);
+    assert_eq!(fixture["account_id"], fixture_account_id);
     assert_eq!(fixture["is_message"], false);
 }
 
