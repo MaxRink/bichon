@@ -17,8 +17,12 @@ use std::{
     sync::{
         LazyLock,
         Mutex,
+        OnceLock,
     },
+    thread,
 };
+
+use tokio::runtime::Runtime;
 
 use bichon_core::{
     common::signal::SignalManager,
@@ -47,6 +51,31 @@ use crate::{
 };
 
 static INIT: Mutex<bool> = Mutex::new(false);
+static ATTACHMENT_RUNTIME: OnceLock<thread::JoinHandle<()>> = OnceLock::new();
+
+/// Keep the Tantivy attachment worker on a runtime that outlives the individual
+/// Tokio runtime created for each test. Without this, the first test that calls
+/// `setup` drops its runtime at completion and silently terminates the global
+/// attachment worker before later tests can flush a fixture.
+fn keep_attachment_worker_alive() {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+    let handle = thread::spawn(move || {
+        let runtime = Runtime::new().expect("attachment test runtime should start");
+        runtime.block_on(async {
+            LazyLock::force(&ATTACHMENT_MANAGER);
+            ready_tx
+                .send(())
+                .expect("attachment test runtime should signal readiness");
+            std::future::pending::<()>().await;
+        });
+    });
+    ATTACHMENT_RUNTIME
+        .set(handle)
+        .expect("attachment test runtime should initialize once");
+    ready_rx
+        .recv()
+        .expect("attachment test runtime should become ready");
+}
 
 /// Initialize the test environment. Safe to call multiple times — only runs once.
 pub async fn setup() {
@@ -78,10 +107,10 @@ pub async fn setup() {
     SignalManager::initialize().await.unwrap();
     DataDirManager::initialize().await.unwrap();
     UserManager::initialize().await.unwrap();
+    keep_attachment_worker_alive();
     BichonContext::initialize().await.unwrap();
     LazyLock::force(&BLOB_MANAGER);
     LazyLock::force(&ENVELOPE_MANAGER);
-    LazyLock::force(&ATTACHMENT_MANAGER);
 
     *initialized = true;
 }
