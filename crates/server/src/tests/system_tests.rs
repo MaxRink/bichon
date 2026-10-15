@@ -127,6 +127,33 @@ async fn blob_integrity_returns_bounded_aggregate_page() {
 }
 
 #[tokio::test]
+async fn blob_integrity_missing_references_are_bounded_and_serialized() {
+    setup().await;
+    let token = admin_token().await;
+    let route = build_api_route();
+    let cli = api_client(route);
+    let resp = cli
+        .get("/api/v1/blob-integrity?page=1&page_size=1&include_missing_references=true")
+        .header("Authorization", &format!("Bearer {}", token))
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+    let body: serde_json::Value = resp.json().await.value().deserialize();
+    let references = body["missing_references"]
+        .as_array()
+        .expect("missing_references must be an array");
+    assert!(
+        references.len() <= 1000,
+        "reference output must remain bounded for a one-item page"
+    );
+    for reference in references {
+        assert!(reference["content_hash"].as_str().is_some());
+        assert!(reference["is_message"].is_boolean());
+        assert!(reference["envelope_id"].as_str().is_some());
+    }
+}
+
+#[tokio::test]
 async fn list_proxy_returns_array() {
     setup().await;
     let token = admin_token().await;
