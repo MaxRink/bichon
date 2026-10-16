@@ -5,6 +5,12 @@
 
 use poem::test::TestClient;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use bichon_core::{
+    database::{delete_impl, insert_impl, manager::DB_MANAGER},
+    users::UserModel,
+};
 
 use super::{admin_token, build_api_route, setup};
 
@@ -173,6 +179,62 @@ async fn oidc_reconciliation_endpoint_validates_identity_and_requires_authentica
         .send()
         .await;
     assert!(response.0.status().is_client_error());
+}
+
+#[tokio::test]
+async fn oidc_reconciliation_endpoint_moves_synthetic_identity_and_preserves_data() {
+    setup().await;
+    let source = UserModel {
+        id: 9_910_001,
+        username: "canary-oidc-source".into(),
+        email: "canary-source@example.test".into(),
+        sso_provider: Some("oidc-canary".into()),
+        sso_id: Some("canary-subject".into()),
+        description: Some("source data".into()),
+        global_roles: vec![7],
+        ..Default::default()
+    };
+    let target = UserModel {
+        id: 9_910_002,
+        username: "canary-native-target".into(),
+        email: "canary-target@example.test".into(),
+        description: Some("native data".into()),
+        global_roles: vec![100_000_000_000_000],
+        account_access_map: BTreeMap::from([(123, 456)]),
+        ..Default::default()
+    };
+    insert_impl(DB_MANAGER.db(), source.clone()).unwrap();
+    insert_impl(DB_MANAGER.db(), target.clone()).unwrap();
+
+    let token = admin_token().await;
+    let cli = api_client(build_api_route());
+    let response = cli
+        .post(&format!("/api/v1/users/{}/oidc-reconcile", target.id))
+        .header("Authorization", &format!("Bearer {token}"))
+        .body_json(&OidcReconcilePayload {
+            source_user_id: source.id,
+            provider: "oidc-canary".into(),
+            subject: "canary-subject".into(),
+        })
+        .send()
+        .await;
+    response.assert_status_is_ok();
+
+    let source_after = UserModel::find(source.id).unwrap().unwrap();
+    let target_after = UserModel::find(target.id).unwrap().unwrap();
+    assert_eq!(source_after.sso_provider, None);
+    assert_eq!(source_after.sso_id, None);
+    assert_eq!(source_after.description, source.description);
+    assert_eq!(target_after.sso_provider.as_deref(), Some("oidc-canary"));
+    assert_eq!(target_after.sso_id.as_deref(), Some("canary-subject"));
+    assert_eq!(target_after.description, target.description);
+    assert_eq!(target_after.global_roles, target.global_roles);
+    assert_eq!(target_after.account_access_map, target.account_access_map);
+
+    delete_impl::<UserModel>(bichon_core::database::manager::DB_MANAGER.db(), &source.id.to_string())
+        .unwrap();
+    delete_impl::<UserModel>(bichon_core::database::manager::DB_MANAGER.db(), &target.id.to_string())
+        .unwrap();
 }
 
 #[tokio::test]
