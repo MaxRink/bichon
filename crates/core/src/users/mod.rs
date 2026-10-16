@@ -1346,4 +1346,173 @@ mod tests {
             "the role id must not be what is looked up"
         );
     }
+
+    fn oidc_test_user(id: u64, username: &str, email: &str, roles: Vec<u64>) -> UserModel {
+        UserModel {
+            id,
+            username: username.to_owned(),
+            email: email.to_owned(),
+            global_roles: roles,
+            created_at: NOW,
+            updated_at: NOW,
+            ..Default::default()
+        }
+    }
+
+    fn insert_oidc_test_user(user: &UserModel) {
+        crate::database::insert_impl(DB_MANAGER.db(), user.clone()).unwrap();
+    }
+
+    fn remove_oidc_test_user(user: &UserModel) {
+        crate::database::delete_impl::<UserModel>(DB_MANAGER.db(), &user.id.to_string()).unwrap();
+    }
+
+    #[test]
+    fn oidc_exact_link_preserves_native_account_data_and_roles() {
+        let native = oidc_test_user(
+            id!(96),
+            "oidc-link-native",
+            "native@example.test",
+            vec![DEFAULT_ADMIN_ROLE_ID, 42],
+        );
+        insert_oidc_test_user(&native);
+
+        let linked = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "native-subject",
+            "different@example.test",
+            Some("oidc-link-native"),
+            Some("oidc-link-native"),
+            Some("oidc-link-native"),
+            Some("native-subject"),
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(linked.id, native.id);
+        assert_eq!(linked.global_roles, native.global_roles);
+        assert_eq!(linked.email, native.email);
+        assert_eq!(linked.sso_provider.as_deref(), Some("oidc"));
+        assert_eq!(linked.sso_id.as_deref(), Some("native-subject"));
+        remove_oidc_test_user(&native);
+    }
+
+    #[test]
+    fn oidc_exact_link_rejects_a_subject_already_bound_to_another_account() {
+        let native = oidc_test_user(
+            id!(96),
+            "oidc-collision-native",
+            "native@example.test",
+            vec![42],
+        );
+        let duplicate = oidc_test_user(
+            id!(96),
+            "oidc-collision-duplicate",
+            "dup@example.test",
+            vec![7],
+        );
+        let duplicate = UserModel {
+            sso_provider: Some("oidc".into()),
+            sso_id: Some("collision-subject".into()),
+            ..duplicate
+        };
+        insert_oidc_test_user(&native);
+        insert_oidc_test_user(&duplicate);
+
+        let result = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "collision-subject",
+            "different@example.test",
+            Some("oidc-collision-native"),
+            Some("oidc-collision-native"),
+            Some("oidc-collision-native"),
+            Some("collision-subject"),
+            7,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            find_impl::<UserModel>(DB_MANAGER.db(), &native.id.to_string()).unwrap(),
+            Some(native.clone())
+        );
+        assert_eq!(
+            find_impl::<UserModel>(DB_MANAGER.db(), &duplicate.id.to_string()).unwrap(),
+            Some(duplicate.clone())
+        );
+        remove_oidc_test_user(&native);
+        remove_oidc_test_user(&duplicate);
+    }
+
+    #[test]
+    fn oidc_near_matches_provision_member_users_without_touching_native_admin() {
+        let native = oidc_test_user(
+            id!(96),
+            "oidc-near-native",
+            "near-native@example.test",
+            vec![DEFAULT_ADMIN_ROLE_ID],
+        );
+        let existing = UserModel {
+            sso_provider: Some("oidc".into()),
+            sso_id: Some("near-existing-subject".into()),
+            ..oidc_test_user(
+                id!(96),
+                "oidc-near-existing",
+                "near-existing@example.test",
+                vec![7],
+            )
+        };
+        insert_oidc_test_user(&native);
+        insert_oidc_test_user(&existing);
+
+        let verified_other = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "near-other-subject",
+            "near-other@example.test",
+            Some("other"),
+            Some("other"),
+            Some("oidc-near-native"),
+            Some("near-native-subject"),
+            7,
+        )
+        .unwrap();
+        assert_ne!(verified_other.id, native.id);
+        assert_eq!(verified_other.global_roles, vec![7]);
+
+        let wrong_subject = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "near-wrong-subject",
+            "near-wrong@example.test",
+            Some("oidc-near-native"),
+            Some("oidc-near-native"),
+            Some("oidc-near-native"),
+            Some("near-native-subject"),
+            7,
+        )
+        .unwrap();
+        assert_ne!(wrong_subject.id, native.id);
+        assert_eq!(wrong_subject.global_roles, vec![7]);
+
+        let wrong_username = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "near-existing-subject",
+            "near-existing@example.test",
+            Some("attacker"),
+            Some("attacker"),
+            Some("oidc-near-native"),
+            Some("near-existing-subject"),
+            7,
+        )
+        .unwrap();
+        assert_eq!(wrong_username.id, existing.id);
+        assert_eq!(wrong_username.global_roles, vec![7]);
+
+        assert_eq!(
+            find_impl::<UserModel>(DB_MANAGER.db(), &native.id.to_string()).unwrap(),
+            Some(native.clone())
+        );
+        remove_oidc_test_user(&native);
+        remove_oidc_test_user(&existing);
+        remove_oidc_test_user(&verified_other);
+        remove_oidc_test_user(&wrong_subject);
+    }
 }
