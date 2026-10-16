@@ -361,6 +361,17 @@ pub struct Settings {
     )]
     pub bichon_oidc_link_username: Option<String>,
 
+    /// Exact OIDC subject eligible for the explicit existing-account link.
+    /// This must be paired with BICHON_OIDC_LINK_USERNAME; it prevents an
+    /// unrelated verified identity from rebinding the configured account.
+    #[arg(
+        long,
+        env,
+        requires = "bichon_oidc_link_username",
+        hide_env_values = true
+    )]
+    pub bichon_oidc_link_subject: Option<String>,
+
     /// When enabled and OIDC is configured, the sign-in page automatically
     /// redirects the browser to the OIDC provider instead of showing the
     /// username/password form. Users can still reach the local login by

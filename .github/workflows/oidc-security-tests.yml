@@ -1,0 +1,24 @@
+name: OIDC security tests
+
+on:
+  pull_request:
+    paths:
+      - crates/core/src/users/mod.rs
+      - crates/core/src/settings/cli.rs
+      - crates/server/src/rest/public/oidc.rs
+      - .github/workflows/oidc-security-tests.yml
+
+permissions:
+  contents: read
+
+jobs:
+  oidc-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: mkdir -p "$RUNNER_TEMP/bichon-root"
+      - name: Run OIDC identity binding tests
+        env:
+          BICHON_ROOT_DIR: ${{ runner.temp }}/bichon-root
+        run: cargo test -p bichon-core users::tests::oidc_ --lib
