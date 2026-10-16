@@ -352,6 +352,15 @@ pub struct Settings {
     )]
     pub bichon_oidc_default_role_id: u64,
 
+    /// Existing local username to bind when a verified OIDC preferred_username
+    /// matches it. Empty/unset disables username-based linking.
+    #[clap(
+        long,
+        env,
+        help = "Existing local username eligible for verified OIDC linking"
+    )]
+    pub bichon_oidc_link_username: Option<String>,
+
     /// When enabled and OIDC is configured, the sign-in page automatically
     /// redirects the browser to the OIDC provider instead of showing the
     /// username/password form. Users can still reach the local login by

@@ -133,6 +133,7 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
         &claims.sub,
         email,
         display_name,
+        SETTINGS.bichon_oidc_link_username.as_deref(),
         SETTINGS.bichon_oidc_default_role_id,
     ) {
         Ok(u) => u,
@@ -216,7 +217,9 @@ pub async fn oidc_handoff(Json(payload): Json<OidcHandoffRequest>) -> Result<Res
         Ok(Some(entry)) => {
             let body = OidcHandoffResponse {
                 access_token: entry.access_token,
-                redirect_to: entry.redirect_after_login.unwrap_or_else(|| "/".to_string()),
+                redirect_to: entry
+                    .redirect_after_login
+                    .unwrap_or_else(|| "/".to_string()),
             };
             match serde_json::to_string(&body) {
                 Ok(json) => Ok(Response::builder()
@@ -263,4 +266,57 @@ fn redirect_login_error(message: &str) -> Response {
         urlencoding::encode(message)
     );
     Redirect::temporary(target).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verified_email;
+    use bichon_core::oidc::id_token::IdTokenClaims;
+    use serde_json::Map;
+
+    fn claims(email_verified: Option<bool>, email: Option<&str>) -> IdTokenClaims {
+        IdTokenClaims {
+            iss: "https://auth.example.com".into(),
+            aud: serde_json::Value::String("bichon".into()),
+            sub: "user-1".into(),
+            exp: 2_000_000_000,
+            iat: None,
+            nbf: None,
+            azp: None,
+            nonce: None,
+            email: email.map(str::to_owned),
+            email_verified,
+            preferred_username: None,
+            name: None,
+            given_name: None,
+            extra: Map::new(),
+        }
+    }
+
+    #[test]
+    fn only_explicitly_verified_non_empty_email_is_linkable() {
+        assert_eq!(
+            verified_email(&claims(Some(true), Some("u@example.test"))),
+            Some("u@example.test")
+        );
+        assert_eq!(
+            verified_email(&claims(Some(false), Some("u@example.test"))),
+            None
+        );
+        assert_eq!(verified_email(&claims(None, Some("u@example.test"))), None);
+        assert_eq!(verified_email(&claims(Some(true), None)), None);
+        assert_eq!(verified_email(&claims(Some(true), Some(""))), None);
+    }
+
+    #[test]
+    fn unverified_claims_cannot_use_configured_username_link() {
+        assert_eq!(
+            verified_email(&claims(Some(false), Some("admin@example.test"))),
+            None
+        );
+        assert_eq!(
+            verified_email(&claims(None, Some("admin@example.test"))),
+            None
+        );
+    }
 }
