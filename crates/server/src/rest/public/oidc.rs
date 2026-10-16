@@ -147,7 +147,9 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
         &claims.sub,
         &email,
         display_name,
+        claims.preferred_username.as_deref(),
         SETTINGS.bichon_oidc_link_username.as_deref(),
+        SETTINGS.bichon_oidc_link_subject.as_deref(),
         SETTINGS.bichon_oidc_default_role_id,
     ) {
         Ok(u) => u,
