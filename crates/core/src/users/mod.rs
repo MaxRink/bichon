@@ -786,15 +786,8 @@ impl BichonUserV2 {
                         }
                         let same_identity = current.sso_id.as_deref() == Some(subject.as_str())
                             && current.sso_provider.as_deref() == Some(provider.as_str());
-                        let conflicting_identity = current
-                            .sso_id
-                            .as_deref()
-                            .is_some_and(|bound| bound != subject.as_str())
-                            || current
-                                .sso_provider
-                                .as_deref()
-                                .is_some_and(|bound| bound != provider.as_str());
-                        if conflicting_identity {
+                        let unbound = current.sso_id.is_none() && current.sso_provider.is_none();
+                        if !unbound && !same_identity {
                             return Err(raise_error!(
                                 "OIDC link target is already bound to a different SSO identity"
                                     .into(),
@@ -826,7 +819,7 @@ impl BichonUserV2 {
         let matches_by_email = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
             normalized_email(&u.email) == email_owned
         })?;
-        if let Some(mut user) = matches_by_email.into_iter().next() {
+        if let Some(user) = matches_by_email.into_iter().next() {
             // An email match is only a safe migration path for a local user
             // that has not already been bound to another SSO identity.  Do
             // not silently replace a different subject/provider: the OIDC
@@ -843,17 +836,38 @@ impl BichonUserV2 {
                     ErrorCode::PermissionDenied
                 ));
             }
-            let now = utc_now!();
-            user.sso_id = Some(subject.to_string());
-            user.sso_provider = Some(provider.to_string());
-            user.updated_at = now;
-            let user_clone = user.clone();
-            update_impl(
+            let expected_email = normalized_email(email);
+            let subject = subject.to_string();
+            let provider = provider.to_string();
+            let updated = update_impl(
                 DB_MANAGER.db(),
                 &user.id.to_string(),
-                move |_current: UserModel| Ok(user_clone.clone()),
+                move |mut current: UserModel| {
+                    if normalized_email(&current.email) != expected_email {
+                        return Err(raise_error!(
+                            "OIDC email link target changed; automatic linking is refused".into(),
+                            ErrorCode::PermissionDenied
+                        ));
+                    }
+                    let same_identity = current.sso_id.as_deref() == Some(subject.as_str())
+                        && current.sso_provider.as_deref() == Some(provider.as_str());
+                    let unbound = current.sso_id.is_none() && current.sso_provider.is_none();
+                    if !unbound && !same_identity {
+                        return Err(raise_error!(
+                            "OIDC email is already bound to a different SSO identity".into(),
+                            ErrorCode::PermissionDenied
+                        ));
+                    }
+                    if same_identity {
+                        return Ok(current);
+                    }
+                    current.sso_id = Some(subject);
+                    current.sso_provider = Some(provider);
+                    current.updated_at = utc_now!();
+                    Ok(current)
+                },
             )?;
-            return Ok(user);
+            return Ok(updated);
         }
 
         // An explicit username allow-list lets an operator bind one existing
@@ -876,7 +890,7 @@ impl BichonUserV2 {
             let matches_by_username = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
                 u.username == username_owned
             })?;
-            if let Some(mut user) = matches_by_username.into_iter().next() {
+            if let Some(user) = matches_by_username.into_iter().next() {
                 if user.sso_id.as_deref().is_some_and(|id| id != subject)
                     || user
                         .sso_provider
@@ -888,17 +902,40 @@ impl BichonUserV2 {
                         ErrorCode::PermissionDenied
                     ));
                 }
-                let now = utc_now!();
-                user.sso_id = Some(subject.to_string());
-                user.sso_provider = Some(provider.to_string());
-                user.updated_at = now;
-                let user_clone = user.clone();
-                update_impl(
+                let expected_username = link_username.to_string();
+                let subject = subject.to_string();
+                let provider = provider.to_string();
+                let updated = update_impl(
                     DB_MANAGER.db(),
                     &user.id.to_string(),
-                    move |_current: UserModel| Ok(user_clone.clone()),
+                    move |mut current: UserModel| {
+                        if current.username != expected_username {
+                            return Err(raise_error!(
+                                "OIDC username link target changed; automatic linking is refused"
+                                    .into(),
+                                ErrorCode::PermissionDenied
+                            ));
+                        }
+                        let same_identity = current.sso_id.as_deref() == Some(subject.as_str())
+                            && current.sso_provider.as_deref() == Some(provider.as_str());
+                        let unbound = current.sso_id.is_none() && current.sso_provider.is_none();
+                        if !unbound && !same_identity {
+                            return Err(raise_error!(
+                                "OIDC username is already bound to a different SSO identity"
+                                    .into(),
+                                ErrorCode::PermissionDenied
+                            ));
+                        }
+                        if same_identity {
+                            return Ok(current);
+                        }
+                        current.sso_id = Some(subject);
+                        current.sso_provider = Some(provider);
+                        current.updated_at = utc_now!();
+                        Ok(current)
+                    },
                 )?;
-                return Ok(user);
+                return Ok(updated);
             }
         }
 
@@ -1549,6 +1586,36 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(UserModel::find(native.id).unwrap(), Some(native.clone()));
         remove_oidc_test_user(&native);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_exact_link_rejects_partial_target_binding() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        for partial in [
+            UserModel {
+                sso_provider: Some("oidc".into()),
+                ..oidc_test_user(id!(96), "oidc-partial-provider", "provider@example.test", vec![7])
+            },
+            UserModel {
+                sso_id: Some("partial-subject".into()),
+                ..oidc_test_user(id!(96), "oidc-partial-subject", "subject@example.test", vec![7])
+            },
+        ] {
+            insert_oidc_test_user(&partial);
+            let result = UserModel::find_or_provision_sso_user(
+                "oidc",
+                "requested-subject",
+                "different@example.test",
+                Some(&partial.username),
+                Some(&partial.username),
+                Some(&partial.username),
+                Some("requested-subject"),
+                7,
+            );
+            assert!(result.is_err());
+            assert_eq!(UserModel::find(partial.id).unwrap(), Some(partial.clone()));
+            remove_oidc_test_user(&partial);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

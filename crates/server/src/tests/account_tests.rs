@@ -30,6 +30,7 @@ struct AccountResp {
     id: u64,
     email: String,
     enabled: bool,
+    deleting: bool,
     #[allow(dead_code)] // present in the API response, not asserted here
     account_name: Option<String>,
 }
@@ -60,6 +61,7 @@ async fn account_crud() {
     let create_payload = CreateAccountPayload {
         email: "test-crud@example.com".into(),
         enabled: false,
+        deleting: false,
         account_type: "NoSync".into(),
         use_dangerous: false,
         account_name: Some("CRUD Test Account".into()),
@@ -148,6 +150,7 @@ async fn create_account_with_invalid_email_fails() {
     let payload = CreateAccountPayload {
         email: "not-an-email".into(),
         enabled: false,
+        deleting: false,
         account_type: "NoSync".into(),
         use_dangerous: false,
         account_name: None,
@@ -172,6 +175,7 @@ async fn create_account_with_empty_email_fails() {
     let payload = CreateAccountPayload {
         email: "".into(),
         enabled: false,
+        deleting: false,
         account_type: "NoSync".into(),
         use_dangerous: false,
         account_name: None,
