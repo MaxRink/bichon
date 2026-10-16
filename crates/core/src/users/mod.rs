@@ -34,16 +34,16 @@ use crate::{
     },
     utc_now,
 };
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::{LazyLock, Mutex},
 };
 use subtle::ConstantTimeEq;
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use tracing::warn;
 
 pub mod acl;
@@ -114,6 +114,10 @@ fn allocate_unique_username(base: &str) -> BichonResult<String> {
         "Failed to allocate a unique username for auto-provisioned OIDC user".into(),
         ErrorCode::InternalError
     ))
+}
+
+fn normalized_email(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -313,9 +317,7 @@ impl BichonUserV2 {
         let live_global: BTreeMap<u64, i64> = self
             .global_role_expiries
             .iter()
-            .filter(|(&rid, &expires_at)| {
-                now < expires_at && self.global_roles.contains(&rid)
-            })
+            .filter(|(&rid, &expires_at)| now < expires_at && self.global_roles.contains(&rid))
             .map(|(&rid, &expires_at)| (rid, expires_at))
             .collect();
         let live_scoped: BTreeMap<u64, i64> = self
@@ -629,6 +631,7 @@ impl BichonUserV2 {
         subject: &str,
         email: &str,
         display_name: Option<&str>,
+        link_username: Option<&str>,
         default_role_id: u64,
     ) -> BichonResult<UserModel> {
         let _binding_guard = SSO_BINDING_LOCK.lock().map_err(|_| {
@@ -648,9 +651,10 @@ impl BichonUserV2 {
             return Ok(user);
         }
 
-        let email_owned = email.to_string();
-        let matches_by_email =
-            filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| u.email == email_owned)?;
+        let email_owned = normalized_email(email);
+        let matches_by_email = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
+            normalized_email(&u.email) == email_owned
+        })?;
         if let Some(mut user) = matches_by_email.into_iter().next() {
             // An email match is only a safe migration path for a local user
             // that has not already been bound to another SSO identity.  Do
@@ -673,10 +677,47 @@ impl BichonUserV2 {
             user.sso_provider = Some(provider.to_string());
             user.updated_at = now;
             let user_clone = user.clone();
-            update_impl(DB_MANAGER.db(), &user.id.to_string(), move |_current: UserModel| {
-                Ok(user_clone.clone())
-            })?;
+            update_impl(
+                DB_MANAGER.db(),
+                &user.id.to_string(),
+                move |_current: UserModel| Ok(user_clone.clone()),
+            )?;
             return Ok(user);
+        }
+
+        // An explicit username allow-list lets an operator bind one existing
+        // local account when the IdP address differs or the account predates
+        // email collection. The OIDC handler only passes this after it has
+        // validated email_verified=true.
+        if let Some(link_username) = link_username.map(str::trim).filter(|s| !s.is_empty()) {
+            let username_owned = link_username.to_string();
+            let matches_by_username = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
+                u.username == username_owned
+            })?;
+            if let Some(mut user) = matches_by_username.into_iter().next() {
+                if user.sso_id.as_deref().is_some_and(|id| id != subject)
+                    || user
+                        .sso_provider
+                        .as_deref()
+                        .is_some_and(|bound_provider| bound_provider != provider)
+                {
+                    return Err(raise_error!(
+                        "OIDC username is already bound to a different SSO identity".into(),
+                        ErrorCode::PermissionDenied
+                    ));
+                }
+                let now = utc_now!();
+                user.sso_id = Some(subject.to_string());
+                user.sso_provider = Some(provider.to_string());
+                user.updated_at = now;
+                let user_clone = user.clone();
+                update_impl(
+                    DB_MANAGER.db(),
+                    &user.id.to_string(),
+                    move |_current: UserModel| Ok(user_clone.clone()),
+                )?;
+                return Ok(user);
+            }
         }
 
         let now = utc_now!();
@@ -1093,12 +1134,7 @@ fn hash_login_password(password: &str) -> BichonResult<String> {
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
-        .map_err(|_| {
-            raise_error!(
-                "Failed to hash password.".into(),
-                ErrorCode::InternalError
-            )
-        })
+        .map_err(|_| raise_error!("Failed to hash password.".into(), ErrorCode::InternalError))
 }
 
 fn stored_password_matches(stored: &str, candidate: &str) -> bool {
@@ -1211,7 +1247,8 @@ mod tests {
         // Simulate the retain `update()` performs when global_roles becomes
         // `[1]`, then a later re-grant of 2.
         let assigned = vec![1u64];
-        u.global_role_expiries.retain(|rid, _| assigned.contains(rid));
+        u.global_role_expiries
+            .retain(|rid, _| assigned.contains(rid));
         u.global_roles = vec![1, 2];
 
         assert_eq!(
