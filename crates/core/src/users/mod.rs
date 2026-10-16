@@ -631,7 +631,9 @@ impl BichonUserV2 {
         subject: &str,
         email: &str,
         display_name: Option<&str>,
+        oidc_username: Option<&str>,
         link_username: Option<&str>,
+        link_subject: Option<&str>,
         default_role_id: u64,
     ) -> BichonResult<UserModel> {
         let _binding_guard = SSO_BINDING_LOCK.lock().map_err(|_| {
@@ -642,6 +644,74 @@ impl BichonUserV2 {
         })?;
         let subject_owned = subject.to_string();
         let provider_owned = provider.to_string();
+
+        // An operator may explicitly reconcile a previously-created OIDC
+        // duplicate with the native account, but only for the exact issuer
+        // subject and exact preferred_username configured together. This is
+        // intentionally narrower than ordinary verified-email provisioning.
+        let explicit_link = link_username
+            .map(str::trim)
+            .filter(|configured| !configured.is_empty())
+            .zip(
+                link_subject
+                    .map(str::trim)
+                    .filter(|configured| !configured.is_empty()),
+            )
+            .filter(|(configured_username, configured_subject)| {
+                oidc_username
+                    .map(str::trim)
+                    .is_some_and(|claim| claim == *configured_username)
+                    && subject == *configured_subject
+            });
+
+        if let Some((configured_username, _)) = explicit_link {
+            let target_matches = filter_impl::<UserModel, _>(DB_MANAGER.db(), {
+                let username = configured_username.to_string();
+                move |u| u.username == username
+            })?;
+            if let Some(mut target) = target_matches.into_iter().next() {
+                let existing_subject_matches = filter_impl::<UserModel, _>(DB_MANAGER.db(), {
+                    let subject = subject.to_string();
+                    let provider = provider.to_string();
+                    move |u| {
+                        u.sso_id.as_deref() == Some(&subject)
+                            && u.sso_provider.as_deref() == Some(&provider)
+                    }
+                })?;
+                for mut duplicate in existing_subject_matches {
+                    if duplicate.id != target.id {
+                        duplicate.sso_id = None;
+                        duplicate.sso_provider = None;
+                        duplicate.updated_at = utc_now!();
+                        let duplicate_clone = duplicate.clone();
+                        update_impl(
+                            DB_MANAGER.db(),
+                            &duplicate.id.to_string(),
+                            move |_current: UserModel| Ok(duplicate_clone.clone()),
+                        )?;
+                    }
+                }
+                if target.sso_id.as_deref().is_some_and(|id| id != subject)
+                    || target
+                        .sso_provider
+                        .as_deref()
+                        .is_some_and(|bound_provider| bound_provider != provider)
+                {
+                    target.sso_id = None;
+                    target.sso_provider = None;
+                }
+                target.sso_id = Some(subject.to_string());
+                target.sso_provider = Some(provider.to_string());
+                target.updated_at = utc_now!();
+                let target_clone = target.clone();
+                update_impl(
+                    DB_MANAGER.db(),
+                    &target.id.to_string(),
+                    move |_current: UserModel| Ok(target_clone.clone()),
+                )?;
+                return Ok(target);
+            }
+        }
 
         let matches_by_sso = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
             u.sso_id.as_deref() == Some(&subject_owned)
@@ -689,7 +759,15 @@ impl BichonUserV2 {
         // local account when the IdP address differs or the account predates
         // email collection. The OIDC handler only passes this after it has
         // validated email_verified=true.
-        if let Some(link_username) = link_username.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(link_username) = link_username
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter(|configured| {
+                oidc_username
+                    .map(str::trim)
+                    .is_some_and(|claim| claim == *configured)
+            })
+        {
             let username_owned = link_username.to_string();
             let matches_by_username = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
                 u.username == username_owned
