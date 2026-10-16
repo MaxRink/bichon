@@ -17,5 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: mkdir -p "$RUNNER_TEMP/bichon-root"
       - name: Run OIDC identity binding tests
-        run: cargo test -p bichon-core users::tests::oidc_ --lib
+        run: cargo test -p bichon-core users::tests::oidc_ --lib -- --bichon-root-dir "$RUNNER_TEMP/bichon-root"
