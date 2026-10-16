@@ -762,6 +762,9 @@ impl BichonUserV2 {
                 oidc_username
                     .map(str::trim)
                     .is_some_and(|claim| claim == *configured)
+                    && link_subject
+                        .map(str::trim)
+                        .is_some_and(|configured_subject| configured_subject == subject)
             })
         {
             let username_owned = link_username.to_string();
@@ -1367,8 +1370,15 @@ mod tests {
         crate::database::delete_impl::<UserModel>(DB_MANAGER.db(), &user.id.to_string()).unwrap();
     }
 
-    #[test]
-    fn oidc_exact_link_preserves_native_account_data_and_roles() {
+    // These tests initialize the shared MemDb, whose background workers need a
+    // Tokio reactor; serialize them because each case intentionally reuses the
+    // same fixture ids in the process-wide test database.
+    static OIDC_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_exact_link_preserves_native_account_data_and_roles() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
         let native = oidc_test_user(
             id!(96),
             "oidc-link-native",
@@ -1397,8 +1407,9 @@ mod tests {
         remove_oidc_test_user(&native);
     }
 
-    #[test]
-    fn oidc_exact_link_rejects_a_subject_already_bound_to_another_account() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_exact_link_rejects_a_subject_already_bound_to_another_account() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
         let native = oidc_test_user(
             id!(96),
             "oidc-collision-native",
@@ -1443,8 +1454,9 @@ mod tests {
         remove_oidc_test_user(&duplicate);
     }
 
-    #[test]
-    fn oidc_near_matches_provision_member_users_without_touching_native_admin() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_near_matches_provision_member_users_without_touching_native_admin() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
         let native = oidc_test_user(
             id!(96),
             "oidc-near-native",
