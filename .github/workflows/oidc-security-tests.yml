@@ -19,4 +19,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: mkdir -p "$RUNNER_TEMP/bichon-root"
       - name: Run OIDC identity binding tests
-        run: cargo test -p bichon-core users::tests::oidc_ --lib -- --bichon-root-dir "$RUNNER_TEMP/bichon-root"
+        env:
+          BICHON_ROOT_DIR: ${{ runner.temp }}/bichon-root
+        run: cargo test -p bichon-core users::tests::oidc_ --lib
