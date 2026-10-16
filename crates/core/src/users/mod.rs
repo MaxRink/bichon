@@ -669,7 +669,7 @@ impl BichonUserV2 {
                 let username = configured_username.to_string();
                 move |u| u.username == username
             })?;
-            if let Some(mut target) = target_matches.into_iter().next() {
+            if let Some(target) = target_matches.into_iter().next() {
                 let existing_subject_matches = filter_impl::<UserModel, _>(DB_MANAGER.db(), {
                     let subject = subject.to_string();
                     let provider = provider.to_string();
@@ -683,29 +683,31 @@ impl BichonUserV2 {
                     .any(|duplicate| duplicate.id != target.id)
                 {
                     return Err(raise_error!(
-                        "OIDC subject is already bound to another account; use the administrator reconciliation command".into(),
+                        "OIDC subject is already bound to another account; automatic linking is refused".into(),
                         ErrorCode::PermissionDenied
                     ));
                 }
-                if target.sso_id.as_deref().is_some_and(|id| id != subject)
-                    || target
-                        .sso_provider
-                        .as_deref()
-                        .is_some_and(|bound_provider| bound_provider != provider)
-                {
-                    target.sso_id = None;
-                    target.sso_provider = None;
-                }
-                target.sso_id = Some(subject.to_string());
-                target.sso_provider = Some(provider.to_string());
-                target.updated_at = utc_now!();
-                let target_clone = target.clone();
-                update_impl(
+                let target_id = target.id.to_string();
+                let configured_username = configured_username.to_string();
+                let subject = subject.to_string();
+                let provider = provider.to_string();
+                let updated = update_impl(
                     DB_MANAGER.db(),
-                    &target.id.to_string(),
-                    move |_current: UserModel| Ok(target_clone.clone()),
+                    &target_id,
+                    move |mut current: UserModel| {
+                        if current.username != configured_username {
+                            return Err(raise_error!(
+                                "OIDC link target username changed; automatic linking is refused".into(),
+                                ErrorCode::PermissionDenied
+                            ));
+                        }
+                        current.sso_id = Some(subject);
+                        current.sso_provider = Some(provider);
+                        current.updated_at = utc_now!();
+                        Ok(current)
+                    },
                 )?;
-                return Ok(target);
+                return Ok(updated);
             }
         }
 
@@ -1379,12 +1381,17 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn oidc_exact_link_preserves_native_account_data_and_roles() {
         let _lock = OIDC_TEST_LOCK.lock().await;
-        let native = oidc_test_user(
-            id!(96),
-            "oidc-link-native",
-            "native@example.test",
-            vec![DEFAULT_ADMIN_ROLE_ID, 42],
-        );
+        let native = UserModel {
+            password: Some("native-password".into()),
+            description: Some("native account".into()),
+            account_access_map: BTreeMap::from([(123, 456)]),
+            ..oidc_test_user(
+                id!(96),
+                "oidc-link-native",
+                "native@example.test",
+                vec![DEFAULT_ADMIN_ROLE_ID, 42],
+            )
+        };
         insert_oidc_test_user(&native);
 
         let linked = UserModel::find_or_provision_sso_user(
@@ -1402,6 +1409,9 @@ mod tests {
         assert_eq!(linked.id, native.id);
         assert_eq!(linked.global_roles, native.global_roles);
         assert_eq!(linked.email, native.email);
+        assert_eq!(linked.password, native.password);
+        assert_eq!(linked.description, native.description);
+        assert_eq!(linked.account_access_map, native.account_access_map);
         assert_eq!(linked.sso_provider.as_deref(), Some("oidc"));
         assert_eq!(linked.sso_id.as_deref(), Some("native-subject"));
         remove_oidc_test_user(&native);
