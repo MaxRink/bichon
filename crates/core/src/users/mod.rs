@@ -625,6 +625,12 @@ impl BichonUserV2 {
         source_user_id: u64,
         target_user_id: u64,
     ) -> BichonResult<()> {
+        if provider.trim().is_empty() || subject.trim().is_empty() {
+            return Err(raise_error!(
+                "OIDC reconciliation requires a non-empty provider and subject".into(),
+                ErrorCode::InvalidParameter
+            ));
+        }
         if source_user_id == target_user_id {
             return Err(raise_error!(
                 "OIDC reconciliation requires distinct source and target users".into(),
@@ -777,6 +783,26 @@ impl BichonUserV2 {
                                 "OIDC link target username changed; automatic linking is refused".into(),
                                 ErrorCode::PermissionDenied
                             ));
+                        }
+                        let same_identity = current.sso_id.as_deref() == Some(subject.as_str())
+                            && current.sso_provider.as_deref() == Some(provider.as_str());
+                        let conflicting_identity = current
+                            .sso_id
+                            .as_deref()
+                            .is_some_and(|bound| bound != subject.as_str())
+                            || current
+                                .sso_provider
+                                .as_deref()
+                                .is_some_and(|bound| bound != provider.as_str());
+                        if conflicting_identity {
+                            return Err(raise_error!(
+                                "OIDC link target is already bound to a different SSO identity"
+                                    .into(),
+                                ErrorCode::PermissionDenied
+                            ));
+                        }
+                        if same_identity {
+                            return Ok(current);
                         }
                         current.sso_id = Some(subject);
                         current.sso_provider = Some(provider);
@@ -1495,6 +1521,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn oidc_exact_link_rejects_target_rebound_before_write() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let native = UserModel {
+            sso_provider: Some("other".into()),
+            sso_id: Some("already-bound".into()),
+            ..oidc_test_user(
+                id!(96),
+                "oidc-rebound-native",
+                "native@example.test",
+                vec![DEFAULT_ADMIN_ROLE_ID],
+            )
+        };
+        insert_oidc_test_user(&native);
+
+        let result = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "requested-subject",
+            "different@example.test",
+            Some("oidc-rebound-native"),
+            Some("oidc-rebound-native"),
+            Some("oidc-rebound-native"),
+            Some("requested-subject"),
+            7,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(UserModel::find(native.id).unwrap(), Some(native.clone()));
+        remove_oidc_test_user(&native);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn oidc_exact_link_rejects_a_subject_already_bound_to_another_account() {
         let _lock = OIDC_TEST_LOCK.lock().await;
         let native = oidc_test_user(
@@ -1693,6 +1750,85 @@ mod tests {
         )
         .is_err());
         assert_eq!(UserModel::find(source.id).unwrap(), Some(source_before));
+        assert_eq!(UserModel::find(target.id).unwrap(), Some(target_before));
+        remove_oidc_test_user(&source);
+        remove_oidc_test_user(&target);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_reconciliation_rejects_invalid_users_and_partial_bindings() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let source = UserModel {
+            sso_provider: Some("oidc".into()),
+            sso_id: Some("reconcile-validation".into()),
+            ..oidc_test_user(id!(96), "oidc-validation-source", "source@example.test", vec![7])
+        };
+        let target = UserModel {
+            sso_id: Some("partial-binding".into()),
+            ..oidc_test_user(id!(96), "native-validation-target", "target@example.test", vec![1])
+        };
+        insert_oidc_test_user(&source);
+        insert_oidc_test_user(&target);
+        let source_before = source.clone();
+        let target_before = target.clone();
+
+        for (provider, subject) in [("", "subject"), ("   ", "subject"), ("oidc", ""), ("oidc", "\t")] {
+            assert!(UserModel::reconcile_sso_identity(provider, subject, source.id, target.id).is_err());
+        }
+        assert!(UserModel::reconcile_sso_identity("oidc", "reconcile-validation", source.id, source.id).is_err());
+        assert!(UserModel::reconcile_sso_identity("oidc", "reconcile-validation", 999_991, target.id).is_err());
+        assert!(UserModel::reconcile_sso_identity("oidc", "reconcile-validation", source.id, 999_992).is_err());
+        assert!(UserModel::reconcile_sso_identity("oidc", "reconcile-validation", source.id, target.id).is_err());
+        assert_eq!(UserModel::find(source.id).unwrap(), Some(source_before));
+        assert_eq!(UserModel::find(target.id).unwrap(), Some(target_before));
+        remove_oidc_test_user(&source);
+        remove_oidc_test_user(&target);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_reconciliation_rolls_back_source_when_target_write_fails() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let source = UserModel {
+            sso_provider: Some("oidc".into()),
+            sso_id: Some("reconcile-rollback".into()),
+            ..oidc_test_user(id!(96), "oidc-rollback-source", "source@example.test", vec![7])
+        };
+        let target = oidc_test_user(
+            id!(96),
+            "native-rollback-target",
+            "target@example.test",
+            vec![1],
+        );
+        insert_oidc_test_user(&source);
+        insert_oidc_test_user(&target);
+        let source_before = source.clone();
+        let target_before = target.clone();
+
+        struct FailingSerialize;
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("intentional test serialization failure"))
+            }
+        }
+
+        let source_key = source.id.to_string();
+        let target_key = target.id.to_string();
+        let expected_source = source_before.clone();
+        let result = with_transaction(DB_MANAGER.db(), move |txn| {
+            let mut changed_source = source_before.clone();
+            changed_source.sso_provider = None;
+            changed_source.sso_id = None;
+            let txn = txn
+                .upsert("users", source_key, &changed_source)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+            txn.upsert("users", target_key, &FailingSerialize)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))
+        });
+        assert!(result.is_err());
+        assert_eq!(UserModel::find(source.id).unwrap(), Some(expected_source));
         assert_eq!(UserModel::find(target.id).unwrap(), Some(target_before));
         remove_oidc_test_user(&source);
         remove_oidc_test_user(&target);

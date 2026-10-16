@@ -35,6 +35,13 @@ struct UpdateUserPayload {
     description: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct OidcReconcilePayload {
+    source_user_id: u64,
+    provider: String,
+    subject: String,
+}
+
 const ADMIN_ROLE_ID: u64 = 100_000_000_000_000;
 
 #[tokio::test]
@@ -138,6 +145,34 @@ async fn create_user_with_invalid_data_fails() {
         .send()
         .await;
     assert!(resp.0.status().is_client_error(), "short password should fail");
+}
+
+#[tokio::test]
+async fn oidc_reconciliation_endpoint_validates_identity_and_requires_authentication() {
+    setup().await;
+    let route = build_api_route();
+    let cli = api_client(route);
+    let payload = OidcReconcilePayload {
+        source_user_id: 123,
+        provider: "   ".into(),
+        subject: "subject".into(),
+    };
+
+    let response = cli
+        .post("/api/v1/users/456/oidc-reconcile")
+        .body_json(&payload)
+        .send()
+        .await;
+    assert!(response.0.status().is_client_error());
+
+    let token = admin_token().await;
+    let response = cli
+        .post("/api/v1/users/456/oidc-reconcile")
+        .header("Authorization", &format!("Bearer {token}"))
+        .body_json(&payload)
+        .send()
+        .await;
+    assert!(response.0.status().is_client_error());
 }
 
 #[tokio::test]

@@ -380,6 +380,18 @@ pub struct OidcReconcileRequest {
     pub subject: String,
 }
 
+impl OidcReconcileRequest {
+    pub fn validate(&self) -> BichonResult<()> {
+        if self.provider.trim().is_empty() || self.subject.trim().is_empty() {
+            return Err(raise_error!(
+                "OIDC reconciliation requires a non-empty provider and subject".into(),
+                ErrorCode::InvalidParameter
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl UserUpdateRequest {
     pub fn validate(&self) -> BichonResult<()> {
         if let Some(username) = &self.username {

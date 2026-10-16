@@ -219,6 +219,7 @@ impl UsersApi {
         context: WrappedContext,
     ) -> ApiResult<()> {
         context.require_permission(None, Permission::USER_MANAGE)?;
+        payload.0.validate()?;
         let target_id = id.0;
         let source_id = payload.0.source_user_id;
         let target_username = UserModel::find(target_id)?
