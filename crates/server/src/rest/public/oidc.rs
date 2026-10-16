@@ -147,6 +147,7 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
         &claims.sub,
         &email,
         display_name,
+        SETTINGS.bichon_oidc_link_username.as_deref(),
         SETTINGS.bichon_oidc_default_role_id,
     ) {
         Ok(u) => u,
@@ -230,7 +231,9 @@ pub async fn oidc_handoff(Json(payload): Json<OidcHandoffRequest>) -> Result<Res
         Ok(Some(entry)) => {
             let body = OidcHandoffResponse {
                 access_token: entry.access_token,
-                redirect_to: entry.redirect_after_login.unwrap_or_else(|| "/".to_string()),
+                redirect_to: entry
+                    .redirect_after_login
+                    .unwrap_or_else(|| "/".to_string()),
             };
             match serde_json::to_string(&body) {
                 Ok(json) => Ok(Response::builder()
@@ -326,5 +329,17 @@ mod tests {
         assert_eq!(verified_email(&claims(None, Some("u@example.test"))), None);
         assert_eq!(verified_email(&claims(Some(true), None)), None);
         assert_eq!(verified_email(&claims(Some(true), Some(""))), None);
+    }
+
+    #[test]
+    fn unverified_claims_cannot_use_configured_username_link() {
+        assert_eq!(
+            verified_email(&claims(Some(false), Some("admin@example.test"))),
+            None
+        );
+        assert_eq!(
+            verified_email(&claims(None, Some("admin@example.test"))),
+            None
+        );
     }
 }
