@@ -588,11 +588,79 @@ impl BichonUserV2 {
         subject: &str,
         email: &str,
         display_name: Option<&str>,
+        oidc_username: Option<&str>,
         link_username: Option<&str>,
+        link_subject: Option<&str>,
         default_role_id: u64,
     ) -> BichonResult<UserModel> {
         let subject_owned = subject.to_string();
         let provider_owned = provider.to_string();
+
+        // An operator may explicitly reconcile a previously-created OIDC
+        // duplicate with the native account, but only for the exact issuer
+        // subject and exact preferred_username configured together. This is
+        // intentionally narrower than ordinary verified-email provisioning.
+        let explicit_link = link_username
+            .map(str::trim)
+            .filter(|configured| !configured.is_empty())
+            .zip(
+                link_subject
+                    .map(str::trim)
+                    .filter(|configured| !configured.is_empty()),
+            )
+            .filter(|(configured_username, configured_subject)| {
+                oidc_username
+                    .map(str::trim)
+                    .is_some_and(|claim| claim == *configured_username)
+                    && subject == *configured_subject
+            });
+
+        if let Some((configured_username, _)) = explicit_link {
+            let target_matches = filter_impl::<UserModel, _>(DB_MANAGER.db(), {
+                let username = configured_username.to_string();
+                move |u| u.username == username
+            })?;
+            if let Some(target) = target_matches.into_iter().next() {
+                let existing_subject_matches = filter_impl::<UserModel, _>(DB_MANAGER.db(), {
+                    let subject = subject.to_string();
+                    let provider = provider.to_string();
+                    move |u| {
+                        u.sso_id.as_deref() == Some(&subject)
+                            && u.sso_provider.as_deref() == Some(&provider)
+                    }
+                })?;
+                if existing_subject_matches
+                    .iter()
+                    .any(|duplicate| duplicate.id != target.id)
+                {
+                    return Err(raise_error!(
+                        "OIDC subject is already bound to another account; automatic linking is refused".into(),
+                        ErrorCode::PermissionDenied
+                    ));
+                }
+                let target_id = target.id.to_string();
+                let configured_username = configured_username.to_string();
+                let subject = subject.to_string();
+                let provider = provider.to_string();
+                let updated = update_impl(
+                    DB_MANAGER.db(),
+                    &target_id,
+                    move |mut current: UserModel| {
+                        if current.username != configured_username {
+                            return Err(raise_error!(
+                                "OIDC link target username changed; automatic linking is refused".into(),
+                                ErrorCode::PermissionDenied
+                            ));
+                        }
+                        current.sso_id = Some(subject);
+                        current.sso_provider = Some(provider);
+                        current.updated_at = utc_now!();
+                        Ok(current)
+                    },
+                )?;
+                return Ok(updated);
+            }
+        }
 
         let matches_by_sso = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
             u.sso_id.as_deref() == Some(&subject_owned)
@@ -624,7 +692,18 @@ impl BichonUserV2 {
         // local account when the IdP address differs or the account predates
         // email collection. The OIDC handler only passes this after it has
         // validated email_verified=true.
-        if let Some(link_username) = link_username.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(link_username) = link_username
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter(|configured| {
+                oidc_username
+                    .map(str::trim)
+                    .is_some_and(|claim| claim == *configured)
+                    && link_subject
+                        .map(str::trim)
+                        .is_some_and(|configured_subject| configured_subject == subject)
+            })
+        {
             let username_owned = link_username.to_string();
             let matches_by_username = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
                 u.username == username_owned
@@ -1190,5 +1269,191 @@ mod tests {
             !u.account_role_expired(5, NOW),
             "the role id must not be what is looked up"
         );
+    }
+
+    fn oidc_test_user(id: u64, username: &str, email: &str, roles: Vec<u64>) -> UserModel {
+        UserModel {
+            id,
+            username: username.to_owned(),
+            email: email.to_owned(),
+            global_roles: roles,
+            created_at: NOW,
+            updated_at: NOW,
+            ..Default::default()
+        }
+    }
+
+    fn insert_oidc_test_user(user: &UserModel) {
+        crate::database::insert_impl(DB_MANAGER.db(), user.clone()).unwrap();
+    }
+
+    fn remove_oidc_test_user(user: &UserModel) {
+        crate::database::delete_impl::<UserModel>(DB_MANAGER.db(), &user.id.to_string()).unwrap();
+    }
+
+    // These tests initialize the shared MemDb, whose background workers need a
+    // Tokio reactor; serialize them because each case intentionally reuses the
+    // same fixture ids in the process-wide test database.
+    static OIDC_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_exact_link_preserves_native_account_data_and_roles() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let native = UserModel {
+            password: Some("native-password".into()),
+            description: Some("native account".into()),
+            account_access_map: BTreeMap::from([(123, 456)]),
+            ..oidc_test_user(
+                id!(96),
+                "oidc-link-native",
+                "native@example.test",
+                vec![DEFAULT_ADMIN_ROLE_ID, 42],
+            )
+        };
+        insert_oidc_test_user(&native);
+
+        let linked = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "native-subject",
+            "different@example.test",
+            Some("oidc-link-native"),
+            Some("oidc-link-native"),
+            Some("oidc-link-native"),
+            Some("native-subject"),
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(linked.id, native.id);
+        assert_eq!(linked.global_roles, native.global_roles);
+        assert_eq!(linked.email, native.email);
+        assert_eq!(linked.password, native.password);
+        assert_eq!(linked.description, native.description);
+        assert_eq!(linked.account_access_map, native.account_access_map);
+        assert_eq!(linked.sso_provider.as_deref(), Some("oidc"));
+        assert_eq!(linked.sso_id.as_deref(), Some("native-subject"));
+        remove_oidc_test_user(&native);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_exact_link_rejects_a_subject_already_bound_to_another_account() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let native = oidc_test_user(
+            id!(96),
+            "oidc-collision-native",
+            "native@example.test",
+            vec![42],
+        );
+        let duplicate = oidc_test_user(
+            id!(96),
+            "oidc-collision-duplicate",
+            "dup@example.test",
+            vec![7],
+        );
+        let duplicate = UserModel {
+            sso_provider: Some("oidc".into()),
+            sso_id: Some("collision-subject".into()),
+            ..duplicate
+        };
+        insert_oidc_test_user(&native);
+        insert_oidc_test_user(&duplicate);
+
+        let result = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "collision-subject",
+            "different@example.test",
+            Some("oidc-collision-native"),
+            Some("oidc-collision-native"),
+            Some("oidc-collision-native"),
+            Some("collision-subject"),
+            7,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            find_impl::<UserModel>(DB_MANAGER.db(), &native.id.to_string()).unwrap(),
+            Some(native.clone())
+        );
+        assert_eq!(
+            find_impl::<UserModel>(DB_MANAGER.db(), &duplicate.id.to_string()).unwrap(),
+            Some(duplicate.clone())
+        );
+        remove_oidc_test_user(&native);
+        remove_oidc_test_user(&duplicate);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_near_matches_provision_member_users_without_touching_native_admin() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let native = oidc_test_user(
+            id!(96),
+            "oidc-near-native",
+            "near-native@example.test",
+            vec![DEFAULT_ADMIN_ROLE_ID],
+        );
+        let existing = UserModel {
+            sso_provider: Some("oidc".into()),
+            sso_id: Some("near-existing-subject".into()),
+            ..oidc_test_user(
+                id!(96),
+                "oidc-near-existing",
+                "near-existing@example.test",
+                vec![7],
+            )
+        };
+        insert_oidc_test_user(&native);
+        insert_oidc_test_user(&existing);
+
+        let verified_other = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "near-other-subject",
+            "near-other@example.test",
+            Some("other"),
+            Some("other"),
+            Some("oidc-near-native"),
+            Some("near-native-subject"),
+            7,
+        )
+        .unwrap();
+        assert_ne!(verified_other.id, native.id);
+        assert_eq!(verified_other.global_roles, vec![7]);
+
+        let wrong_subject = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "near-wrong-subject",
+            "near-wrong@example.test",
+            Some("oidc-near-native"),
+            Some("oidc-near-native"),
+            Some("oidc-near-native"),
+            Some("near-native-subject"),
+            7,
+        )
+        .unwrap();
+        assert_ne!(wrong_subject.id, native.id);
+        assert_eq!(wrong_subject.global_roles, vec![7]);
+
+        let wrong_username = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "near-existing-subject",
+            "near-existing@example.test",
+            Some("attacker"),
+            Some("attacker"),
+            Some("oidc-near-native"),
+            Some("near-existing-subject"),
+            7,
+        )
+        .unwrap();
+        assert_eq!(wrong_username.id, existing.id);
+        assert_eq!(wrong_username.global_roles, vec![7]);
+
+        assert_eq!(
+            find_impl::<UserModel>(DB_MANAGER.db(), &native.id.to_string()).unwrap(),
+            Some(native.clone())
+        );
+        remove_oidc_test_user(&native);
+        remove_oidc_test_user(&existing);
+        remove_oidc_test_user(&verified_other);
+        remove_oidc_test_user(&wrong_subject);
     }
 }
