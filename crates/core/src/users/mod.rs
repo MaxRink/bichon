@@ -678,18 +678,14 @@ impl BichonUserV2 {
                             && u.sso_provider.as_deref() == Some(&provider)
                     }
                 })?;
-                for mut duplicate in existing_subject_matches {
-                    if duplicate.id != target.id {
-                        duplicate.sso_id = None;
-                        duplicate.sso_provider = None;
-                        duplicate.updated_at = utc_now!();
-                        let duplicate_clone = duplicate.clone();
-                        update_impl(
-                            DB_MANAGER.db(),
-                            &duplicate.id.to_string(),
-                            move |_current: UserModel| Ok(duplicate_clone.clone()),
-                        )?;
-                    }
+                if existing_subject_matches
+                    .iter()
+                    .any(|duplicate| duplicate.id != target.id)
+                {
+                    return Err(raise_error!(
+                        "OIDC subject is already bound to another account; use the administrator reconciliation command".into(),
+                        ErrorCode::PermissionDenied
+                    ));
                 }
                 if target.sso_id.as_deref().is_some_and(|id| id != subject)
                     || target
