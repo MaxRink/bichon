@@ -372,6 +372,14 @@ pub struct UserUpdateRequest {
     pub language: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
+pub struct OidcReconcileRequest {
+    pub source_user_id: u64,
+    pub provider: String,
+    pub subject: String,
+}
+
 impl UserUpdateRequest {
     pub fn validate(&self) -> BichonResult<()> {
         if let Some(username) = &self.username {

@@ -570,6 +570,23 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// Read a record while the caller's write gate is held.
+    pub fn get<T: for<'de> Deserialize<'de>>(
+        &self,
+        collection: &str,
+        key: &str,
+    ) -> Result<Option<T>> {
+        let inner = self.db.inner.lock().unwrap();
+        inner
+            .data
+            .get(collection)
+            .and_then(|records| records.get(key))
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(DbError::from)
+    }
+
     pub fn insert<T: Serialize>(
         mut self,
         collection: &str,

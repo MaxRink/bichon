@@ -26,7 +26,8 @@ use bichon_core::saved_search::SavedSearchModel;
 use bichon_core::token::AccessTokenModel;
 use bichon_core::users::minimal::MinimalUser;
 use bichon_core::users::payload::{
-    RoleCreateRequest, RoleUpdateRequest, UserCreateRequest, UserUpdateRequest,
+    OidcReconcileRequest, RoleCreateRequest, RoleUpdateRequest, UserCreateRequest,
+    UserUpdateRequest,
 };
 use bichon_core::users::permissions::Permission;
 use bichon_core::users::role::{RoleType, UserRole};
@@ -199,6 +200,43 @@ impl UsersApi {
         let target_username = UserModel::find(target_id)?
             .map(|u| u.username)
             .unwrap_or_else(|| format!("user-{target_id}"));
+        emit(Event::UserUpdated {
+            updated_by: context.user.username.clone(),
+            target_user: target_username,
+        });
+        Ok(())
+    }
+
+    #[oai(
+        path = "/users/:id/oidc-reconcile",
+        method = "post",
+        operation_id = "reconcile_oidc_identity"
+    )]
+    async fn reconcile_oidc_identity(
+        &self,
+        id: Path<u64>,
+        payload: Json<OidcReconcileRequest>,
+        context: WrappedContext,
+    ) -> ApiResult<()> {
+        context.require_permission(None, Permission::USER_MANAGE)?;
+        let target_id = id.0;
+        let source_id = payload.0.source_user_id;
+        let target_username = UserModel::find(target_id)?
+            .map(|u| u.username)
+            .unwrap_or_else(|| format!("user-{target_id}"));
+        let source_username = UserModel::find(source_id)?
+            .map(|u| u.username)
+            .unwrap_or_else(|| format!("user-{source_id}"));
+        UserModel::reconcile_sso_identity(
+            &payload.0.provider,
+            &payload.0.subject,
+            source_id,
+            target_id,
+        )?;
+        emit(Event::UserUpdated {
+            updated_by: context.user.username.clone(),
+            target_user: source_username,
+        });
         emit(Event::UserUpdated {
             updated_by: context.user.username.clone(),
             target_user: target_username,

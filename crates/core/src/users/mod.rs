@@ -617,6 +617,83 @@ impl BichonUserV2 {
         .next())
     }
 
+    /// Atomically move one verified OIDC identity from a duplicate account to
+    /// an explicitly selected native account, preserving every other field.
+    pub fn reconcile_sso_identity(
+        provider: &str,
+        subject: &str,
+        source_user_id: u64,
+        target_user_id: u64,
+    ) -> BichonResult<()> {
+        if source_user_id == target_user_id {
+            return Err(raise_error!(
+                "OIDC reconciliation requires distinct source and target users".into(),
+                ErrorCode::InvalidParameter
+            ));
+        }
+
+        let _binding_guard = SSO_BINDING_LOCK.lock().map_err(|_| {
+            raise_error!(
+                "OIDC identity binding lock is poisoned".into(),
+                ErrorCode::InternalError
+            )
+        })?;
+        let provider = provider.to_string();
+        let subject = subject.to_string();
+        with_transaction(DB_MANAGER.db(), move |txn| {
+            let source_key = source_user_id.to_string();
+            let target_key = target_user_id.to_string();
+            let source = txn
+                .get::<UserModel>("users", &source_key)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?
+                .ok_or_else(|| {
+                    raise_error!(
+                        "OIDC reconciliation source user was not found".into(),
+                        ErrorCode::ResourceNotFound
+                    )
+                })?;
+            let target = txn
+                .get::<UserModel>("users", &target_key)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?
+                .ok_or_else(|| {
+                    raise_error!(
+                        "OIDC reconciliation target user was not found".into(),
+                        ErrorCode::ResourceNotFound
+                    )
+                })?;
+
+            if source.sso_provider.as_deref() != Some(provider.as_str())
+                || source.sso_id.as_deref() != Some(subject.as_str())
+            {
+                return Err(raise_error!(
+                    "OIDC reconciliation source is not bound to the verified identity".into(),
+                    ErrorCode::PermissionDenied
+                ));
+            }
+            if target.sso_provider.is_some() || target.sso_id.is_some() {
+                return Err(raise_error!(
+                    "OIDC reconciliation target already has an SSO identity".into(),
+                    ErrorCode::PermissionDenied
+                ));
+            }
+
+            let mut source_updated = source;
+            source_updated.sso_provider = None;
+            source_updated.sso_id = None;
+            source_updated.updated_at = utc_now!();
+            let mut target_updated = target;
+            target_updated.sso_provider = Some(provider);
+            target_updated.sso_id = Some(subject);
+            target_updated.updated_at = utc_now!();
+
+            let txn = txn
+                .upsert("users", source_key, &source_updated)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+            txn.upsert("users", target_key, &target_updated)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))
+        })
+    }
+
     /// Resolve or auto-provision a Bichon user for an OIDC login.
     ///
     /// Resolution order:
@@ -1536,5 +1613,88 @@ mod tests {
         remove_oidc_test_user(&existing);
         remove_oidc_test_user(&verified_other);
         remove_oidc_test_user(&wrong_subject);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_reconciliation_moves_only_the_verified_identity_atomically() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let source = UserModel {
+            sso_provider: Some("oidc".into()),
+            sso_id: Some("reconcile-subject".into()),
+            description: Some("duplicate data".into()),
+            ..oidc_test_user(id!(96), "oidc-duplicate", "duplicate@example.test", vec![7])
+        };
+        let target = UserModel {
+            password: Some("native-password".into()),
+            description: Some("native data".into()),
+            account_access_map: BTreeMap::from([(123, 456)]),
+            ..oidc_test_user(id!(96), "native-admin", "native@example.test", vec![1, 42])
+        };
+        insert_oidc_test_user(&source);
+        insert_oidc_test_user(&target);
+
+        // This update models a concurrent unrelated edit completed before the
+        // reconciliation write acquires the transaction gate.
+        update_impl::<UserModel>(DB_MANAGER.db(), &target.id.to_string(), move |mut current| {
+            current.description = Some("fresh native data".into());
+            Ok(current)
+        })
+        .unwrap();
+
+        UserModel::reconcile_sso_identity("oidc", "reconcile-subject", source.id, target.id)
+            .unwrap();
+        let source_after = UserModel::find(source.id).unwrap().unwrap();
+        let target_after = UserModel::find(target.id).unwrap().unwrap();
+        assert_eq!(source_after.sso_id, None);
+        assert_eq!(source_after.sso_provider, None);
+        assert_eq!(source_after.global_roles, source.global_roles);
+        assert_eq!(target_after.sso_id.as_deref(), Some("reconcile-subject"));
+        assert_eq!(target_after.sso_provider.as_deref(), Some("oidc"));
+        assert_eq!(target_after.description.as_deref(), Some("fresh native data"));
+        assert_eq!(target_after.password, target.password);
+        assert_eq!(target_after.global_roles, target.global_roles);
+        assert_eq!(target_after.account_access_map, target.account_access_map);
+        remove_oidc_test_user(&source_after);
+        remove_oidc_test_user(&target_after);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_reconciliation_rejects_collisions_and_wrong_identity_without_changes() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let source = UserModel {
+            sso_provider: Some("oidc".into()),
+            sso_id: Some("reconcile-collision".into()),
+            ..oidc_test_user(id!(96), "oidc-source", "source@example.test", vec![7])
+        };
+        let target = UserModel {
+            sso_provider: Some("other".into()),
+            sso_id: Some("already-bound".into()),
+            ..oidc_test_user(id!(96), "native-target", "target@example.test", vec![1])
+        };
+        insert_oidc_test_user(&source);
+        insert_oidc_test_user(&target);
+        let source_before = source.clone();
+        let target_before = target.clone();
+
+        assert!(UserModel::reconcile_sso_identity(
+            "oidc",
+            "reconcile-collision",
+            source.id,
+            target.id
+        )
+        .is_err());
+        assert_eq!(UserModel::find(source.id).unwrap(), Some(source_before.clone()));
+        assert_eq!(UserModel::find(target.id).unwrap(), Some(target_before.clone()));
+        assert!(UserModel::reconcile_sso_identity(
+            "oidc",
+            "wrong-subject",
+            source.id,
+            target.id
+        )
+        .is_err());
+        assert_eq!(UserModel::find(source.id).unwrap(), Some(source_before));
+        assert_eq!(UserModel::find(target.id).unwrap(), Some(target_before));
+        remove_oidc_test_user(&source);
+        remove_oidc_test_user(&target);
     }
 }
