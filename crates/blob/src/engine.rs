@@ -65,6 +65,18 @@ pub struct Stats {
     pub segment_count: usize,
 }
 
+/// Read-only result for checking an indexed blob without returning its data.
+/// `payload_verified` is only set when the caller explicitly requests a
+/// bounded payload check; the default probe checks the index and segment
+/// bounds only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeResult {
+    pub indexed: bool,
+    pub segment_present: bool,
+    pub bounds_valid: bool,
+    pub payload_verified: bool,
+}
+
 /// One sealed, immutable segment as a backup artifact.
 #[derive(Debug, Clone)]
 pub struct SegmentArtifact {
@@ -309,6 +321,44 @@ impl Engine {
 
         let value = compress::decompress(&entry.data, entry.codec, entry.raw_size as usize)?;
         Ok(Some(value))
+    }
+
+    /// Check an indexed blob's backing segment and record bounds without
+    /// returning the blob. With `verify_payload`, the selected blob is read
+    /// and decompressed so the segment checksum/compression path is checked.
+    pub fn probe(&self, key: &[u8; 32], verify_payload: bool) -> Result<ProbeResult> {
+        let Some(record) = self.shared.index_store.get(key)? else {
+            return Ok(ProbeResult::default());
+        };
+
+        let inner = self.shared.inner.read().unwrap();
+        let seg_path = inner.segment_path(record.segment_id)?;
+        if !seg_path.exists() {
+            return Ok(ProbeResult {
+                indexed: true,
+                ..Default::default()
+            });
+        }
+        let length = std::fs::metadata(&seg_path)?.len();
+        let bounds_valid = record
+            .offset
+            .checked_add(ENTRY_HEADER_SIZE as u64)
+            .and_then(|offset| offset.checked_add(record.data_size as u64))
+            .map(|end| end <= length)
+            .unwrap_or(false);
+        drop(inner);
+
+        let payload_verified = if verify_payload && bounds_valid {
+            self.get(key)?.is_some()
+        } else {
+            false
+        };
+        Ok(ProbeResult {
+            indexed: true,
+            segment_present: true,
+            bounds_valid,
+            payload_verified,
+        })
     }
 
     pub fn delete(&self, key: &[u8; 32]) -> Result<()> {
@@ -936,5 +986,56 @@ mod tests {
             engine.set_gc_paused(false);
             engine.shutdown().unwrap();
         }
+    }
+
+    #[test]
+    fn probe_distinguishes_missing_key_and_valid_payload() {
+        let dir = TempDir::new().unwrap();
+        let engine = Engine::open(dir.path(), no_background_config()).unwrap();
+        let key = test_key(0x61);
+        engine.put(key, b"probe-payload", Codec::Zstd).unwrap();
+
+        assert_eq!(
+            engine.probe(&key, true).unwrap(),
+            ProbeResult {
+                indexed: true,
+                segment_present: true,
+                bounds_valid: true,
+                payload_verified: true,
+            }
+        );
+        let missing = test_key(0x62);
+        assert_eq!(engine.probe(&missing, false).unwrap(), ProbeResult::default());
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn probe_reports_truncated_segment_without_reading_imap() {
+        let dir = TempDir::new().unwrap();
+        let engine = Engine::open(dir.path(), no_background_config()).unwrap();
+        let key = test_key(0x63);
+        engine.put(key, b"probe-payload", Codec::Zstd).unwrap();
+        engine.prepare_for_backup().unwrap();
+        let segment = std::fs::read_dir(dir.path().join("segments"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(segment)
+            .unwrap();
+        file.set_len(0).unwrap();
+        assert_eq!(
+            engine.probe(&key, false).unwrap(),
+            ProbeResult {
+                indexed: true,
+                segment_present: true,
+                bounds_valid: false,
+                payload_verified: false,
+            }
+        );
+        engine.shutdown().unwrap();
     }
 }

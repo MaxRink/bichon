@@ -938,6 +938,41 @@ pub struct BlobRepairReport {
     pub error: Option<String>,
 }
 
+/// Inspects one envelope's indexed blob references without contacting IMAP or
+/// changing local storage. Callers can use this as a safe preflight before a
+/// repair request.
+pub fn inspect_envelope_blobs(
+    account_id: u64,
+    envelope_id: &str,
+) -> BichonResult<BlobRepairReport> {
+    let envelope_with_attachments = ENVELOPE_MANAGER
+        .get_envelope_by_id(account_id, envelope_id)?
+        .ok_or_else(|| {
+            raise_error!(
+                format!("Envelope not found: account_id={account_id} envelope_id={envelope_id}"),
+                ErrorCode::ResourceNotFound
+            )
+        })?;
+    let attachments = envelope_with_attachments.attachments;
+    let envelope = envelope_with_attachments.envelope;
+    let (email_missing, missing_before) = missing_blobs(&envelope, attachments.as_deref())?;
+    let status = if !email_missing && missing_before.is_empty() {
+        "complete"
+    } else {
+        "repairable_candidate"
+    };
+    Ok(BlobRepairReport {
+        envelope_id: envelope_id.to_string(),
+        status: status.into(),
+        email_missing_before: email_missing,
+        email_missing_after: email_missing,
+        email_blob_missing: email_missing,
+        missing_after: missing_before.clone(),
+        missing_before,
+        ..Default::default()
+    })
+}
+
 fn complete_repair_report(
     report: &mut BlobRepairReport,
     email_missing_after: bool,
@@ -1228,6 +1263,37 @@ mod test {
             super::BLOB_MANAGER.get_email(&email_hash).unwrap(),
             Some(original_email)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_blobs_reports_nonempty_indexed_attachment_reference() {
+        use bytes::Bytes;
+
+        let missing_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let raw = format!(
+            "Message-ID: <missing-fixture@example.test>\r\n\r\nbody\r\n<<BICHON_DETACH_HASH:{missing_hash}>>"
+        );
+        let email_hash = super::compute_content_hash(raw.as_bytes());
+        super::BLOB_MANAGER
+            .queue(super::DetachedEmail {
+                email: (email_hash.clone(), Bytes::from(raw)),
+                attachments: None,
+            })
+            .await;
+        super::BLOB_MANAGER.drain().await;
+
+        let envelope = super::Envelope {
+            content_hash: email_hash,
+            ..Default::default()
+        };
+        let attachments = vec![super::AttachmentInfo {
+            content_hash: missing_hash.into(),
+            ..Default::default()
+        }];
+        let (email_missing, missing) = super::missing_blobs(&envelope, Some(&attachments))
+            .expect("missing-reference inspection should succeed");
+        assert!(!email_missing);
+        assert_eq!(missing, vec![missing_hash]);
     }
 
     #[test]

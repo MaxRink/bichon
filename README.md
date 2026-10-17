@@ -398,6 +398,17 @@ Interactive API documentation is available at:
 
 All `/api/v1/*` endpoints require `Authorization: Bearer <token>`.
 
+### Read-only blob integrity audit
+
+The fork adds the admin-only `GET /api/v1/blob-integrity` endpoint. It scans a
+bounded attachment-index page and returns aggregate counts for missing index
+entries, missing segments, invalid record bounds, and (when explicitly
+requested) payload verification. The default mode does not return blob data,
+contact IMAP, or write storage. Use `page_size` up to 1000 and set
+`verify_payload=true` only for a bounded checksum/decompression check. The
+response deliberately omits hashes, names, paths, message content, and account
+identifiers.
+
 ### OIDC SSO security boundary
 
 The MaxRink fork exposes OIDC at `/api/auth/oidc/login` and
