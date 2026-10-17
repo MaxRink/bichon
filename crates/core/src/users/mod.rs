@@ -675,6 +675,12 @@ impl BichonUserV2 {
         let matches_by_email = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
             normalized_email(&u.email) == email_owned
         })?;
+        if matches_by_email.len() > 1 {
+            return Err(raise_error!(
+                "OIDC email matches multiple local accounts; automatic linking is refused".into(),
+                ErrorCode::PermissionDenied
+            ));
+        }
         if let Some(mut user) = matches_by_email.into_iter().next() {
             let now = utc_now!();
             user.sso_id = Some(subject.to_string());
@@ -1383,6 +1389,48 @@ mod tests {
         );
         remove_oidc_test_user(&native);
         remove_oidc_test_user(&duplicate);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oidc_ambiguous_normalized_email_refuses_to_link_either_account() {
+        let _lock = OIDC_TEST_LOCK.lock().await;
+        let first = oidc_test_user(
+            id!(96),
+            "oidc-email-match-first",
+            " shared@example.test ",
+            vec![42],
+        );
+        let second = oidc_test_user(
+            id!(96),
+            "oidc-email-match-second",
+            "SHARED@example.test",
+            vec![7],
+        );
+        insert_oidc_test_user(&first);
+        insert_oidc_test_user(&second);
+
+        let result = UserModel::find_or_provision_sso_user(
+            "oidc",
+            "ambiguous-email-subject",
+            "Shared@example.test",
+            Some("shared"),
+            Some("shared"),
+            None,
+            None,
+            7,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            find_impl::<UserModel>(DB_MANAGER.db(), &first.id.to_string()).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            find_impl::<UserModel>(DB_MANAGER.db(), &second.id.to_string()).unwrap(),
+            Some(second.clone())
+        );
+        remove_oidc_test_user(&first);
+        remove_oidc_test_user(&second);
     }
 
     #[tokio::test(flavor = "current_thread")]
