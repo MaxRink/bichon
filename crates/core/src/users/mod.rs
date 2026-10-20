@@ -115,6 +115,12 @@ fn explicit_link_matches_claim(claim_email: &str, configured_email: &str) -> boo
     normalized_email(claim_email) == normalized_email(configured_email)
 }
 
+fn eligible_email_fallback(user: &UserModel, claim_email: &str) -> bool {
+    normalized_email(&user.email) == normalized_email(claim_email)
+        && user.sso_id.is_none()
+        && user.sso_provider.is_none()
+}
+
 fn validate_explicit_oidc_link(
     email: &str,
     link_email: Option<&str>,
@@ -182,6 +188,13 @@ pub struct LoginResult {
 }
 
 pub const DEFAULT_ADMIN_USER_ID: u64 = 100000000000000;
+
+/// Username of the default administrator created on first startup.
+pub const DEFAULT_ADMIN_USERNAME: &str = "admin";
+
+/// The password the default administrator is created with. The WebUI shows a
+/// notifications-bell reminder for as long as this password still works.
+pub const DEFAULT_ADMIN_PASSWORD: &str = "admin@bichon";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BichonUserV2 {
@@ -442,9 +455,9 @@ impl BichonUserV2 {
             // 2. Insert the BichonUser with the updated schema
             let user = UserModel {
                 id: DEFAULT_ADMIN_USER_ID,
-                username: "admin".into(),
+                username: DEFAULT_ADMIN_USERNAME.into(),
                 email: "placeholder@example.com".into(),
-                password: Some(hash_login_password("admin@bichon")?),
+                password: Some(hash_login_password(DEFAULT_ADMIN_PASSWORD)?),
 
                 // Use global_roles as defined in our new schema
                 global_roles: vec![DEFAULT_ADMIN_ROLE_ID],
@@ -631,15 +644,8 @@ impl BichonUserV2 {
         find_impl::<UserModel>(DB_MANAGER.db(), &user_id.to_string())
     }
 
-    /// Resolve or auto-provision a Bichon user for an OIDC login.
-    ///
-    /// Resolution order:
-    ///   1. Match on `(sso_provider, sso_id)` — same subject that logged in before.
-    ///   2. Match on `email` — bind the existing user to this SSO identity.
-    ///   3. Auto-provision a new user with the configured default global role.
-    ///
-    /// Returns the resolved/created user. The caller is expected to issue a
-    /// WebUI access token for that user.
+    /// Resolve or provision a user for an OIDC login, binding by stable
+    /// provider and subject before considering the email address.
     pub fn find_or_provision_sso_user(
         provider: &str,
         subject: &str,
@@ -664,12 +670,11 @@ impl BichonUserV2 {
         let link_is_active = link_config
             .map(|(_, link_email)| explicit_link_matches_claim(email, link_email))
             .unwrap_or(false);
-
         let matches_by_sso = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
             u.sso_id.as_deref() == Some(&subject_owned)
                 && u.sso_provider.as_deref() == Some(&provider_owned)
         })?;
-        if let Some(mut user) = matches_by_sso.into_iter().next() {
+        if let Some(user) = matches_by_sso.into_iter().next() {
             if link_config.map(|(id, _)| id) == Some(user.id) {
                 if !link_is_active {
                     return Err(raise_error!(
@@ -677,34 +682,19 @@ impl BichonUserV2 {
                         ErrorCode::PermissionDenied
                     ));
                 }
-                validate_explicit_oidc_link(
-                    email,
-                    explicit_link_email,
-                    Some(&user),
-                    provider,
-                    subject,
-                )?;
+                validate_explicit_oidc_link(email, explicit_link_email, Some(&user), provider, subject)?;
                 return Ok(user);
             }
             if link_is_active {
                 let (target_id, link_email) = link_config.expect("active OIDC link configuration");
                 let target = find_impl::<UserModel>(DB_MANAGER.db(), &target_id.to_string())?;
-                validate_explicit_oidc_link(
-                    email,
-                    Some(link_email),
-                    target.as_ref(),
-                    provider,
-                    subject,
-                )?;
+                validate_explicit_oidc_link(email, Some(link_email), target.as_ref(), provider, subject)?;
                 if !is_empty_sso_placeholder(&user) {
                     return Err(raise_error!(
                         "Existing OIDC identity is bound to a non-empty native user; refusing reassignment".into(),
                         ErrorCode::PermissionDenied
                     ));
                 }
-                user.sso_provider = None;
-                user.sso_id = None;
-                user.updated_at = utc_now!();
                 let expected_provider = provider.to_string();
                 let expected_subject = subject.to_string();
                 update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
@@ -727,27 +717,14 @@ impl BichonUserV2 {
             }
         }
 
-        // Linking a verified OIDC identity to a native account is a privileged
-        // deployment decision. Require both an immutable native ID and the
-        // exact configured email claim; never fall back to an arbitrary
-        // same-email takeover. A conflicting existing identity is rejected.
         if link_is_active {
             let (user_id, link_email) = link_config.expect("active OIDC link configuration");
             let user = find_impl::<UserModel>(DB_MANAGER.db(), &user_id.to_string())?;
-            validate_explicit_oidc_link(
-                email,
-                Some(link_email),
-                user.as_ref(),
-                provider,
-                subject,
-            )?;
-            let mut user = user.expect("validated explicit OIDC link target");
+            validate_explicit_oidc_link(email, Some(link_email), user.as_ref(), provider, subject)?;
+            let user = user.expect("validated explicit OIDC link target");
             if user.sso_provider.is_some() || user.sso_id.is_some() {
                 return Ok(user);
             }
-            user.sso_provider = Some(provider.to_string());
-            user.sso_id = Some(subject.to_string());
-            user.updated_at = utc_now!();
             let expected_provider = provider.to_string();
             let expected_subject = subject.to_string();
             update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
@@ -770,35 +747,41 @@ impl BichonUserV2 {
             return Ok(user);
         }
 
-        let email_owned = email.to_string();
-        let matches_by_email =
-            filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| u.email == email_owned)?;
-        if let Some(mut user) = matches_by_email.into_iter().next() {
+        // Email fallback is deliberately fail-closed.  OIDC email claims are
+        // not stable identifiers and must never select an arbitrary account
+        // when duplicate/case-variant local records exist.
+        let email_owned = normalized_email(email);
+        let matches_by_email = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
+            eligible_email_fallback(u, &email_owned)
+        })?;
+        if matches_by_email.len() > 1 {
+            return Err(raise_error!(
+                "OIDC email matches multiple eligible native users; refusing automatic linking".into(),
+                ErrorCode::PermissionDenied
+            ));
+        }
+        if let Some(user) = matches_by_email.into_iter().next() {
             let now = utc_now!();
-            user.sso_id = Some(subject.to_string());
-            user.sso_provider = Some(provider.to_string());
-            user.updated_at = now;
             let provider = provider.to_string();
             let subject = subject.to_string();
-            update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
+            let updated = update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
                 current.sso_id = Some(subject);
                 current.sso_provider = Some(provider);
-                current.updated_at = utc_now!();
+                current.updated_at = now;
                 Ok(current)
             })?;
-            return Ok(user);
+            return Ok(updated);
         }
 
         let now = utc_now!();
-        let base = derive_username_base(email, display_name);
-        let username = allocate_unique_username(&base)?;
+        let username = allocate_unique_username(&derive_username_base(email, display_name))?;
         let new_user = UserModel {
             id: id!(96),
             username,
             email: email.to_string(),
             password: None,
             account_access_map: BTreeMap::new(),
-            description: Some(format!("Auto-provisioned via OIDC ({})", provider)),
+            description: Some(format!("Auto-provisioned via OIDC ({provider})")),
             global_roles: vec![default_role_id],
             avatar: None,
             created_at: now,
@@ -811,17 +794,30 @@ impl BichonUserV2 {
             totp_secret: None,
             totp_enabled: false,
             totp_recovery_codes: Vec::new(),
-            // SSO-provisioned role assignments are permanent (no expiries).
             global_role_expiries: BTreeMap::new(),
             account_role_expiries: BTreeMap::new(),
         };
-
         let user_clone = new_user.clone();
         with_transaction(DB_MANAGER.db(), move |txn| {
             txn.insert("users", new_user.key(), &new_user)
                 .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))
         })?;
         Ok(user_clone)
+    }
+
+    /// Whether the default administrator account still authenticates with the
+    /// well-known initial password. Read-only: verifies the stored hash
+    /// directly instead of going through `authenticate_user`, so probing never
+    /// touches login bookkeeping (lockout counters, audit events, token
+    /// issuance). Drives the WebUI notifications-bell reminder.
+    pub fn default_admin_password_active() -> bool {
+        match Self::find(DEFAULT_ADMIN_USER_ID) {
+            Ok(Some(user)) => match user.password.as_deref() {
+                Some(stored) => stored_password_matches(stored, DEFAULT_ADMIN_PASSWORD),
+                None => false,
+            },
+            _ => false,
+        }
     }
 
     // ── TOTP two-factor authentication ─────────────────────────────
@@ -1211,6 +1207,25 @@ fn hash_login_password(password: &str) -> BichonResult<String> {
         })
 }
 
+/// Verify `candidate` against a stored password hash without any of the
+/// login bookkeeping. Handles both current argon2id hashes and the legacy
+/// encrypted-format hashes, mirroring the check in `authenticate_user`.
+fn stored_password_matches(stored: &str, candidate: &str) -> bool {
+    if stored.starts_with("$argon2id$") {
+        match PasswordHash::new(stored) {
+            Ok(parsed) => Argon2::default()
+                .verify_password(candidate.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        }
+    } else {
+        match decrypt!(stored) {
+            Ok(decrypted) => bool::from(candidate.as_bytes().ct_eq(decrypted.as_bytes())),
+            Err(_) => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,6 +1336,37 @@ mod tests {
     }
 
     #[test]
+    fn email_fallback_matches_trimmed_case_insensitively() {
+        let user = link_target(" Admin@Example.COM ");
+        assert!(eligible_email_fallback(&user, "admin@example.com"));
+    }
+
+    #[test]
+    fn email_fallback_rejects_already_bound_account() {
+        let mut user = link_target("admin@example.com");
+        user.sso_provider = Some("authelia".into());
+        user.sso_id = Some("subject".into());
+        assert!(!eligible_email_fallback(&user, "admin@example.com"));
+    }
+
+    #[test]
+    fn email_fallback_does_not_treat_duplicate_variant_as_unique() {
+        let first = link_target("admin@example.com");
+        let second = link_target(" Admin@Example.COM ");
+        assert!(eligible_email_fallback(&first, "ADMIN@example.com"));
+        assert!(eligible_email_fallback(&second, "ADMIN@example.com"));
+        // Two eligible records would be rejected by the caller's exact-count
+        // check rather than selecting the first database result.
+        assert_eq!(
+            [first, second]
+                .iter()
+                .filter(|u| eligible_email_fallback(u, "ADMIN@example.com"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn only_an_empty_placeholder_can_be_reassigned() {
         let empty = link_target("admin@example.com");
         assert!(is_empty_sso_placeholder(&empty));
@@ -1347,6 +1393,20 @@ mod tests {
             86_400_000,
             "expiry must be milliseconds to compare against utc_now!()"
         );
+    }
+
+    /// The bell reminder hinges on this check: a fresh default-admin hash
+    /// must match the well-known initial password, and nothing else.
+    #[test]
+    fn stored_password_matches_recognises_the_initial_password_only() {
+        let hash = hash_login_password(DEFAULT_ADMIN_PASSWORD).unwrap();
+        assert!(stored_password_matches(&hash, DEFAULT_ADMIN_PASSWORD));
+        assert!(!stored_password_matches(&hash, "admin@bichon-typo"));
+    }
+
+    #[test]
+    fn a_mangled_hash_never_matches() {
+        assert!(!stored_password_matches("not-a-valid-hash", DEFAULT_ADMIN_PASSWORD));
     }
 
     #[test]

@@ -16,7 +16,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Restore from a native S3 restore point — the reverse of the engine.
+//! Restore from a native restore point — the reverse of the engine. The
+//! source is whichever target [`RestoreOptions::target_type`] selects: an
+//! S3-compatible endpoint or a local directory.
 //!
 //! A manifest is fully self-describing ("each lists every object it
 //! references", design doc §4), so a restore is a plain, idempotent fan-out:
@@ -47,11 +49,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use object_store::ObjectStore;
 use tracing::{info, warn};
 
-use crate::backup::config::{RestoreFileConfig, DEFAULT_PREFIX};
+use crate::backup::config::{BackupTargetType, RestoreFileConfig, DEFAULT_PREFIX};
 use crate::backup::engine::{s3_store, BackupEngine, S3Options};
-use crate::backup::manifest::{Manifest, ObjectRef};
+use crate::backup::manifest::{Manifest, ObjectRef, LATEST_NAME, MANIFEST_PREFIX};
+use crate::backup::path::{check_free_space, path_contains, paths_equal};
 use crate::backup::prepare::unpackage_dir;
 use crate::error::code::ErrorCode;
 use crate::error::BichonResult;
@@ -63,8 +67,6 @@ use crate::settings::cli::RestoreArgs;
 /// Mirrors `settings::dir` / `feature_db_path` so a fresh install pointed at
 /// the restored directory finds everything where it expects it.
 pub(crate) const MEMDB_DIR: &str = "memdb";
-pub(crate) const IMAP_UID_SUBDIR: &str = "imap-uid";
-pub(crate) const IMAP_UID_FILE: &str = "imap-uid.redb";
 pub(crate) const STORAGE_DIR: &str = "bichon-storage";
 pub(crate) const BLOBS_DIR: &str = "blobs";
 pub(crate) const SEGMENTS_DIR: &str = "segments";
@@ -80,11 +82,27 @@ pub(crate) const ENVELOPE_INDEX_DIR: &str = "mail_metadata";
 pub(crate) const ATTACHMENT_INDEX_DIR: &str = "attachment_metadata";
 
 /// CLI restore options for the one-shot disaster-recovery tools.
-#[derive(Debug, Clone)]
+///
+/// `Default` is derived so that adding a field does not have to touch every
+/// construction site — this struct is built by literal in a dozen places
+/// across the core tests and the admin binary.
+#[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
-    /// `s3://<endpoint>/<bucket>/<prefix>` — the backup target.
+    /// Which backend the restore point is read from.
+    pub target_type: BackupTargetType,
+    /// `s3://<endpoint>/<bucket>/<prefix>` — the backup target. Only
+    /// meaningful for an S3 target; use [`RestoreOptions::target_display`] for
+    /// anything an operator reads.
     pub s3_uri: String,
-    /// Restore a specific point (`m-<id>`); default = LATEST.
+    /// Absolute path of the local backup directory (when
+    /// `target_type` is `local`).
+    pub local_dir: Option<PathBuf>,
+    /// Object-store prefix for a local target. An S3 target carries its
+    /// prefix inside `s3_uri` instead.
+    pub prefix: String,
+    /// Restore a specific point; default = LATEST. [`normalize_point`]
+    /// accepts the id, the pasted object name (`m-<id>` / `m-<id>.json.gz`),
+    /// or the keyword `LATEST` (any case) for the newest point.
     pub point: Option<String>,
     /// Empty target directory (R7). Ignored in `verify_only` mode.
     pub into: PathBuf,
@@ -146,6 +164,31 @@ impl RestoreTargets {
     }
 }
 
+impl RestoreOptions {
+    /// Where this restore reads from, for logs and operator-facing messages.
+    pub fn target_display(&self) -> String {
+        match self.target_type {
+            BackupTargetType::S3 => self.s3_uri.clone(),
+            BackupTargetType::Local => match &self.local_dir {
+                Some(dir) => dir.display().to_string(),
+                None => "<local directory not configured>".to_string(),
+            },
+        }
+    }
+
+    /// The object-store prefix, with the default applied. Only used by the
+    /// local branch — the S3 branch takes its prefix from the URI, so the two
+    /// can never disagree.
+    fn effective_prefix(&self) -> String {
+        let prefix = self.prefix.trim().trim_end_matches('/');
+        if prefix.is_empty() {
+            DEFAULT_PREFIX.to_string()
+        } else {
+            prefix.to_string()
+        }
+    }
+}
+
 /// The outcome of a restore run, for the CLI/WebUI report.
 #[derive(Debug, Clone, Default)]
 pub struct RestoreReport {
@@ -159,7 +202,9 @@ pub struct RestoreReport {
     /// Bytes downloaded and verified (verify-only: bytes streamed).
     pub bytes_checked: u64,
     pub memdb_restored: bool,
-    pub imap_uid_restored: bool,
+    /// Accounts whose IMAP UIDVALIDITY generation was bumped so clients drop
+    /// their caches (see `archive::imap::stable_uid::bump_all_generations`).
+    pub generations_bumped: usize,
     pub segments_restored: usize,
     pub audit_restored: bool,
     pub audit_deltas_replayed: usize,
@@ -181,9 +226,10 @@ pub struct RestoreReport {
 ///
 /// Shared by the `bichon-admin restore` entry point (community) and the Pro
 /// admin binary — both build the same [`RestoreOptions`] from the
-/// subcommand's flags. The S3 backend connection details come from the JSON
-/// config file named by `--config` ([`RestoreFileConfig`]); restore
-/// deliberately does not read the local install's metadata store, so it runs
+/// subcommand's flags. The backend connection details come from the JSON
+/// config file named by `--config` ([`RestoreFileConfig`]) — an S3-compatible
+/// endpoint or a local directory; restore deliberately does not read the local
+/// install's metadata store, so it runs
 /// unchanged on a fresh disaster-recovery box. `--into` is required unless
 /// the run is a `verify_only` drill (R7).
 pub fn restore_options_from_cli(args: &RestoreArgs, verify_only: bool) -> BichonResult<RestoreOptions> {
@@ -196,7 +242,10 @@ pub fn restore_options_from_cli(args: &RestoreArgs, verify_only: bool) -> Bichon
     }
     let file = RestoreFileConfig::load(Path::new(&args.config))?;
     Ok(RestoreOptions {
+        target_type: file.target_type,
         s3_uri: file.s3_uri(),
+        local_dir: file.local_dir.as_deref().map(PathBuf::from),
+        prefix: file.prefix.clone(),
         point: args.point.clone(),
         into,
         index_dir: args.index_dir.clone().map(PathBuf::from),
@@ -252,6 +301,23 @@ pub fn register_audit_replayer(replayer: Arc<dyn AuditReplayer>) {
     AUDIT_REPLAYERS.lock().unwrap().push(replayer);
 }
 
+/// Normalize a `--point` value (CLI flag, interactive prompt, drill) to a
+/// manifest id. `LATEST` (any case) and blank select the newest point — the
+/// same as passing nothing — and a name pasted straight from the bucket
+/// listing (`m-<id>` or `m-<id>.json.gz`) is accepted for the bare `<id>`,
+/// so `load_by_id` does not look for `m-m-<id>.json.gz`.
+pub(crate) fn normalize_point(point: Option<&str>) -> Option<String> {
+    let raw = point?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case(LATEST_NAME) {
+        return None;
+    }
+    let id = raw
+        .strip_prefix(MANIFEST_PREFIX)
+        .unwrap_or(raw)
+        .trim_end_matches(".json.gz");
+    Some(id.to_string())
+}
+
 /// Parse `s3://<endpoint>/<bucket>/<prefix>` into `(endpoint, bucket, prefix)`.
 /// `endpoint` is the bare host[:port] (`s3://localhost:9000/bichon-backups/...`);
 /// the prefix is optional and defaults to [`DEFAULT_PREFIX`].
@@ -303,26 +369,39 @@ pub async fn run_restore(opts: &RestoreOptions) -> BichonResult<RestoreReport> {
     restore_with_engine(opts, &engine).await
 }
 
-/// Build the S3-backed engine for a restore run. Shared by [`run_restore`]
-/// and [`restore_preflight`].
+/// Build the engine for a restore run. Shared by [`run_restore`] and
+/// [`restore_preflight`].
 pub fn build_restore_engine(opts: &RestoreOptions) -> BichonResult<BackupEngine> {
-    let (endpoint, bucket, prefix) = parse_s3_uri(&opts.s3_uri)?;
-    let store_opts = S3Options {
-        endpoint,
-        bucket,
-        region: opts
-            .region
-            .clone()
-            .unwrap_or_else(|| "us-east-1".to_string()),
-        // Restore runs before the server starts (the DB is not open yet), so
-        // there is no WebUI/system_config fallback here: credentials come
-        // from the restore config file. Empty strings are fine for public /
-        // anonymous-access buckets.
-        access_key: opts.access_key.clone().unwrap_or_default(),
-        secret_key: opts.secret_key.clone().unwrap_or_default(),
-        force_path_style: true,
+    let (store, prefix): (Arc<dyn ObjectStore>, String) = match opts.target_type {
+        BackupTargetType::S3 => {
+            let (endpoint, bucket, prefix) = parse_s3_uri(&opts.s3_uri)?;
+            let store_opts = S3Options {
+                endpoint,
+                bucket,
+                region: opts
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+                // Restore runs before the server starts (the DB is not open
+                // yet), so there is no WebUI/system_config fallback here:
+                // credentials come from the restore config file. Empty strings
+                // are fine for public / anonymous-access buckets.
+                access_key: opts.access_key.clone().unwrap_or_default(),
+                secret_key: opts.secret_key.clone().unwrap_or_default(),
+                force_path_style: true,
+            };
+            (s3_store(&store_opts)?, prefix)
+        }
+        BackupTargetType::Local => {
+            let dir = opts.local_dir.clone().ok_or_else(|| {
+                raise_error!(
+                    "restore: a local target requires a directory".to_string(),
+                    ErrorCode::InvalidParameter
+                )
+            })?;
+            (BackupEngine::local_store(&dir)?, opts.effective_prefix())
+        }
     };
-    let store = s3_store(&store_opts)?;
     Ok(BackupEngine::new(store, &prefix))
 }
 
@@ -341,8 +420,8 @@ pub struct RestorePreflight {
 
 pub async fn restore_preflight(opts: &RestoreOptions) -> BichonResult<RestorePreflight> {
     let engine = build_restore_engine(opts)?;
-    let manifest = match &opts.point {
-        Some(id) => engine.load_by_id(id).await?.ok_or_else(|| {
+    let manifest = match normalize_point(opts.point.as_deref()) {
+        Some(id) => engine.load_by_id(&id).await?.ok_or_else(|| {
             raise_error!(
                 format!("restore: restore point {id} not found"),
                 ErrorCode::ResourceNotFound
@@ -352,7 +431,7 @@ pub async fn restore_preflight(opts: &RestoreOptions) -> BichonResult<RestorePre
             raise_error!(
                 format!(
                     "restore: no restore point found at {} (run the backup first)",
-                    opts.s3_uri
+                    opts.target_display()
                 ),
                 ErrorCode::ResourceNotFound
             )
@@ -414,15 +493,19 @@ pub fn check_restore_space(targets: &RestoreTargets, manifest: &Manifest) -> Bic
 /// point is hashed and compared to the manifest, nothing is written. `point`
 /// is the manifest id; `None` verifies the latest restore point.
 ///
-/// Builds the engine from the page-configured S3 settings (same store +
-/// prefix as the run-time backend), so a drill always exercises the real
-/// target.
+/// Builds the engine from the page-configured target (same store + prefix as
+/// the run-time backend), so a drill always exercises the real target —
+/// whichever kind it is.
 pub async fn run_drill(point: Option<&str>) -> BichonResult<RestoreReport> {
-    let opts = crate::backup::config::s3_options()?;
-    let store = crate::backup::engine::s3_store(&opts)?;
-    let engine = crate::backup::engine::BackupEngine::new(store, &crate::backup::config::prefix());
+    let target = crate::backup::config::target()?;
+    let store = target.build_store()?;
+    let engine =
+        crate::backup::engine::BackupEngine::new(store, &crate::backup::config::prefix());
     let ropts = RestoreOptions {
-        s3_uri: "s3://configured/drill".to_string(),
+        target_type: crate::backup::config::target_type(),
+        s3_uri: target.display(),
+        local_dir: crate::backup::config::local_dir().map(PathBuf::from),
+        prefix: crate::backup::config::prefix(),
         point: point.map(|s| s.to_string()),
         into: PathBuf::new(),
         index_dir: None,
@@ -444,8 +527,8 @@ pub(crate) async fn restore_with_engine(
     engine: &BackupEngine,
 ) -> BichonResult<RestoreReport> {
     // ── pick the restore point ────────────────────────────────────────────
-    let manifest = match &opts.point {
-        Some(id) => engine.load_by_id(id).await?.ok_or_else(|| {
+    let manifest = match normalize_point(opts.point.as_deref()) {
+        Some(id) => engine.load_by_id(&id).await?.ok_or_else(|| {
             raise_error!(
                 format!("restore: restore point {id} not found"),
                 ErrorCode::ResourceNotFound
@@ -455,7 +538,8 @@ pub(crate) async fn restore_with_engine(
             raise_error!(
                 format!(
                     "restore: no restore point found at {} ({} run the backup first)",
-                    opts.s3_uri, ""
+                    opts.target_display(),
+                    ""
                 ),
                 ErrorCode::ResourceNotFound
             )
@@ -533,6 +617,44 @@ pub(crate) async fn restore_with_engine(
     let _ = std::fs::remove_dir_all(&work);
     result?;
 
+    // Invalidate every IMAP client cache for the restored accounts. A restore
+    // point is internally consistent, so the restored counter/index pair looks
+    // healthy while clients still hold UIDs from the generation they last saw —
+    // bumping the UIDVALIDITY generation is the only way to make them resync
+    // instead of trusting a cache that no longer matches. See
+    // `archive::imap::stable_uid::bump_all_generations`.
+    if report.memdb_restored {
+        let memdb_dir = targets.root.join(MEMDB_DIR);
+        match bichon_memdb::MemDb::open_with(&memdb_dir, bichon_memdb::Durability::Full)
+            .map_err(|e| {
+                raise_error!(
+                    format!("restore: cannot open the restored memdb: {e}"),
+                    ErrorCode::InternalError
+                )
+            })
+            .and_then(|db| crate::archive::imap::stable_uid::bump_all_generations(&db))
+        {
+            Ok(bumped) => {
+                report.generations_bumped = bumped;
+                if bumped > 0 {
+                    warn!(
+                        accounts = bumped,
+                        "restore: bumped the IMAP UIDVALIDITY generation of every account so \
+                         clients resynchronize instead of trusting stale UID caches"
+                    );
+                }
+            }
+            Err(e) => {
+                // Not fatal: the server's startup reconcile repairs a counter
+                // that ends up behind the index, and a client that keeps a
+                // stale cache is a correctness problem the operator can still
+                // resolve by removing the account's cache. Refusing an
+                // otherwise-complete restore would be worse.
+                warn!("restore: could not invalidate IMAP client caches: {e:#?}");
+            }
+        }
+    }
+
     // The commit marker: without STORAGE_VERSION, `check_data_status` treats
     // the directory as a fresh (empty) install and `initialize()` would
     // refuse to touch existing data.
@@ -598,13 +720,6 @@ async fn restore_into(
             )
         })?;
         report.memdb_restored = true;
-    }
-
-    // imap-uid: stable UID store, a single redb file.
-    if let Some(obj) = &manifest.objects.imap_uid {
-        let dest = targets.root.join(IMAP_UID_SUBDIR).join(IMAP_UID_FILE);
-        download(engine, obj, &dest, report).await?;
-        report.imap_uid_restored = true;
     }
 
     // blob: sealed segments, back in the layout the engine discovers on open.
@@ -733,7 +848,6 @@ fn manifest_refs(m: &Manifest) -> Vec<(&str, &str, u64)> {
     let mut out = Vec::new();
     for slot in [
         &m.objects.memdb,
-        &m.objects.imap_uid,
         &m.objects.integrity,
         &m.objects.timestamp,
     ]
@@ -764,36 +878,10 @@ fn manifest_refs(m: &Manifest) -> Vec<(&str, &str, u64)> {
 }
 
 // ── path safety helpers (Windows-tolerant) ─────────────────────────────────
-
-fn paths_equal(a: &Path, b: &Path) -> bool {
-    normalize(a) == normalize(b)
-}
-
-/// `a` is `b` or inside it (case-insensitive on Windows).
-fn path_contains(container: &Path, inside: &Path) -> bool {
-    let c = normalize(container);
-    let i = normalize(inside);
-    i == c || i.starts_with(&c)
-}
-
-fn normalize(p: &Path) -> String {
-    let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let mut s = canon.to_string_lossy().replace('\\', "/");
-    // Windows `canonicalize` returns verbatim paths (`\\?\C:\...`), which
-    // would break prefix comparison against a raw path for the same
-    // directory; strip the prefix so both sides compare on the same form.
-    if let Some(stripped) = s.strip_prefix("//?/") {
-        s = stripped.to_string();
-    }
-    if !s.ends_with('/') {
-        s.push('/');
-    }
-    #[cfg(windows)]
-    {
-        s = s.to_lowercase();
-    }
-    s
-}
+//
+// `paths_equal` / `path_contains` / `normalize` live in `backup::path` — the
+// local backup target needs the same containment test, and a second copy
+// would drift on the Windows verbatim-path handling.
 
 /// R7: a restore writes only into a directory that is empty and neither
 /// contains nor is contained by the live data root.
@@ -845,17 +933,12 @@ fn assert_clean_restore_target(dir: &Path, root: &Path) -> BichonResult<()> {
     Ok(())
 }
 
-/// Safety margin applied to the bytes a restore needs before comparing
-/// against free space (mirrors the export path's `DISK_SAFETY_FACTOR`).
-const DISK_SAFETY_FACTOR: f64 = 1.2;
-
 /// Capacity check: each target's filesystem must have room for the objects
 /// that will land on it (with a safety margin), or the restore is refused
 /// before any bytes are written. Root gets everything except blob segments
 /// (→ data target) and tantivy copies (→ index target).
 fn assert_sufficient_space(targets: &RestoreTargets, m: &Manifest) -> BichonResult<()> {
     let root_needed = m.objects.memdb.as_ref().map_or(0, |o| o.bytes)
-        + m.objects.imap_uid.as_ref().map_or(0, |o| o.bytes)
         + m.objects.integrity.as_ref().map_or(0, |o| o.bytes)
         + m.objects.timestamp.as_ref().map_or(0, |o| o.bytes)
         + m.objects.audit.as_ref().map_or(0, |a| {
@@ -868,43 +951,9 @@ fn assert_sufficient_space(targets: &RestoreTargets, m: &Manifest) -> BichonResu
         ("blob data", &targets.data, data_needed),
         ("index", &targets.index, index_needed),
     ] {
-        check_free_space(name, dir, needed)?;
+        check_free_space("restore", name, dir, needed)?;
     }
     Ok(())
-}
-
-fn check_free_space(name: &str, dir: &Path, needed: u64) -> BichonResult<()> {
-    if needed == 0 {
-        return Ok(());
-    }
-    let free = available_space_on(dir);
-    let required = (needed as f64 * DISK_SAFETY_FACTOR) as u64;
-    if free < required {
-        return Err(raise_error!(
-            format!(
-                "restore: insufficient free space on the {name} target {}: {} bytes required (with safety buffer), {} bytes available",
-                dir.display(),
-                required,
-                free
-            ),
-            ErrorCode::InternalError
-        ));
-    }
-    Ok(())
-}
-
-/// Free bytes on the filesystem containing `dir`, matched by mount-point
-/// prefix (mirrors `crate::import::check_temp_disk_space`).
-fn available_space_on(dir: &Path) -> u64 {
-    use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
-    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    for disk in disks.list() {
-        if canonical.starts_with(disk.mount_point()) {
-            return disk.available_space();
-        }
-    }
-    u64::MAX
 }
 
 /// Human-readable CLI report for a restore run. Shared by the community and
@@ -946,10 +995,6 @@ pub fn format_restore_report(report: &RestoreReport) -> String {
         out.push_str(&format!(
             "  memdb           : {}\n",
             yes(report.memdb_restored)
-        ));
-        out.push_str(&format!(
-            "  imap-uid        : {}\n",
-            yes(report.imap_uid_restored)
         ));
         out.push_str(&format!(
             "  blob segments   : {}\n",
@@ -1088,7 +1133,6 @@ mod tests {
                 ),
                 bytes: memdb_gz.len() as u64,
             }),
-            imap_uid: Some(obj.clone()),
             blob_segments: vec![SegmentRef {
                 seg_id: 3,
                 obj: obj.clone(),
@@ -1205,6 +1249,35 @@ mod tests {
         assert!(parse_s3_uri("s3://h").is_err());
     }
 
+    #[test]
+    fn normalize_point_variants() {
+        // Keyword / blank / absent → the newest point (no explicit id).
+        assert!(normalize_point(None).is_none());
+        assert!(normalize_point(Some("")).is_none());
+        assert!(normalize_point(Some("   ")).is_none());
+        assert!(normalize_point(Some("LATEST")).is_none());
+        assert!(normalize_point(Some("latest")).is_none());
+
+        // Bare id passes through untouched.
+        assert_eq!(
+            normalize_point(Some("0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")).as_deref(),
+            Some("0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")
+        );
+
+        // A name pasted from the bucket listing loses its `m-` / `.json.gz`,
+        // so load_by_id does not look for `m-m-<id>.json.gz`.
+        assert_eq!(
+            normalize_point(Some("m-0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")).as_deref(),
+            Some("0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")
+        );
+        assert_eq!(
+            normalize_point(Some("m-0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.json.gz")).as_deref(),
+            Some("0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")
+        );
+        // Surrounding whitespace is tolerated.
+        assert_eq!(normalize_point(Some("  m-abc  ")).as_deref(), Some("abc"));
+    }
+
     #[tokio::test]
     async fn full_round_trip_with_fake_replayer() {
         init_test_env();
@@ -1217,7 +1290,7 @@ mod tests {
 
         // Build an engine over a local store and commit a full manifest.
         let store_dir = root.join("store");
-        let store = BackupEngine::local_store(&store_dir).unwrap();
+        let store = BackupEngine::local_store_for_test(&store_dir).unwrap();
         let engine = BackupEngine::new(store, "test");
         let _hello = engine
             .upload_bytes_for_test(b"hello")
@@ -1246,12 +1319,12 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: None,
+            ..Default::default()
         };
 
         let report = restore_with_engine(&opts, &engine).await.unwrap();
 
         assert!(report.memdb_restored);
-        assert!(report.imap_uid_restored);
         assert_eq!(report.segments_restored, 1);
         assert!(report.audit_restored);
         assert_eq!(report.audit_deltas_replayed, 2);
@@ -1263,10 +1336,6 @@ mod tests {
         // On-disk layout matches the production mapping.
         assert_eq!(
             std::fs::read(into.join("memdb/snapshot.json")).unwrap(),
-            b"hello"
-        );
-        assert_eq!(
-            std::fs::read(into.join("imap-uid/imap-uid.redb")).unwrap(),
             b"hello"
         );
         assert_eq!(
@@ -1306,6 +1375,7 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: None,
+            ..Default::default()
         };
 
         // Default layout: indices and blob store live under the target root.
@@ -1347,7 +1417,7 @@ mod tests {
         let index_parent = root.join("fresh-index");
         let data_parent = root.join("fresh-data");
 
-        let store = BackupEngine::local_store(&root.join("store")).unwrap();
+        let store = BackupEngine::local_store_for_test(&root.join("store")).unwrap();
         let engine = BackupEngine::new(store, "test");
         let _hello = engine.upload_bytes_for_test(b"hello").await.unwrap();
         let manifest = sample_manifest(&engine, &root).await;
@@ -1364,6 +1434,7 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: None,
+            ..Default::default()
         };
 
         let report = restore_with_engine(&opts, &engine).await.unwrap();
@@ -1374,10 +1445,6 @@ mod tests {
         // Root-owned data lands under `into`...
         assert_eq!(
             std::fs::read(into.join("memdb/snapshot.json")).unwrap(),
-            b"hello"
-        );
-        assert_eq!(
-            std::fs::read(into.join("imap-uid/imap-uid.redb")).unwrap(),
             b"hello"
         );
         // ...blob segments land under the data parent, indices under the index
@@ -1404,7 +1471,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let into = root.join("restored");
 
-        let store = BackupEngine::local_store(&root.join("store")).unwrap();
+        let store = BackupEngine::local_store_for_test(&root.join("store")).unwrap();
         let engine = BackupEngine::new(store, "test");
         let _hello = engine.upload_bytes_for_test(b"hello").await.unwrap();
         let manifest = sample_manifest(&engine, &root).await;
@@ -1423,6 +1490,7 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: Some(PathBuf::from(SETTINGS.root_dir())),
+            ..Default::default()
         };
 
         let err = restore_with_engine(&opts, &engine).await.unwrap_err();
@@ -1446,7 +1514,7 @@ mod tests {
         std::fs::create_dir_all(data_parent.join(STORAGE_DIR)).unwrap();
         std::fs::write(data_parent.join(STORAGE_DIR).join("leftover"), "not-empty").unwrap();
 
-        let store = BackupEngine::local_store(&root.join("store")).unwrap();
+        let store = BackupEngine::local_store_for_test(&root.join("store")).unwrap();
         let engine = BackupEngine::new(store, "test");
         let _hello = engine.upload_bytes_for_test(b"hello").await.unwrap();
         let manifest = sample_manifest(&engine, &root).await;
@@ -1463,6 +1531,7 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: None,
+            ..Default::default()
         };
 
         let err = restore_with_engine(&opts, &engine).await.unwrap_err();
@@ -1481,7 +1550,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let into = root.join("restored-verify");
 
-        let store = BackupEngine::local_store(&root.join("store2")).unwrap();
+        let store = BackupEngine::local_store_for_test(&root.join("store2")).unwrap();
         let engine = BackupEngine::new(store, "test");
         let _hello = engine.upload_bytes_for_test(b"hello").await.unwrap();
         let manifest = sample_manifest(&engine, &root).await;
@@ -1498,11 +1567,12 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: None,
+            ..Default::default()
         };
 
         let report = restore_with_engine(&opts, &engine).await.unwrap();
         assert!(report.verify_only);
-        assert_eq!(report.objects_total, 9);
+        assert_eq!(report.objects_total, 8);
         assert!(
             report.bytes_checked > 35,
             "at least the 7 hello-sized slots"
@@ -1521,7 +1591,7 @@ mod tests {
         let into = root.join("restored-full");
         std::fs::create_dir_all(into.join("something")).unwrap();
 
-        let store = BackupEngine::local_store(&root.join("store3")).unwrap();
+        let store = BackupEngine::local_store_for_test(&root.join("store3")).unwrap();
         let engine = BackupEngine::new(store, "test");
         let _hello = engine.upload_bytes_for_test(b"hello").await.unwrap();
         let manifest = sample_manifest(&engine, &root).await;
@@ -1538,6 +1608,7 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: None,
+            ..Default::default()
         };
 
         let err = restore_with_engine(&opts, &engine).await.unwrap_err();
@@ -1554,7 +1625,7 @@ mod tests {
         let root = test_root("liveroot");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let store = BackupEngine::local_store(&root.join("store4")).unwrap();
+        let store = BackupEngine::local_store_for_test(&root.join("store4")).unwrap();
         let engine = BackupEngine::new(store, "test");
         let _hello = engine.upload_bytes_for_test(b"hello").await.unwrap();
         let manifest = sample_manifest(&engine, &root).await;
@@ -1572,6 +1643,7 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: Some(PathBuf::from(SETTINGS.root_dir())),
+            ..Default::default()
         };
 
         let err = restore_with_engine(&opts, &engine).await.unwrap_err();
@@ -1611,7 +1683,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let into = root.join("restored-noreplay");
 
-        let store = BackupEngine::local_store(&root.join("store5")).unwrap();
+        let store = BackupEngine::local_store_for_test(&root.join("store5")).unwrap();
         let engine = BackupEngine::new(store, "test");
         let _hello = engine.upload_bytes_for_test(b"hello").await.unwrap();
         let manifest = sample_manifest(&engine, &root).await;
@@ -1632,6 +1704,7 @@ mod tests {
             secret_key: None,
             region: None,
             live_root: None,
+            ..Default::default()
         };
 
         let report = restore_with_engine(&opts, &engine).await.unwrap();
@@ -1639,6 +1712,182 @@ mod tests {
         assert_eq!(report.audit_deltas_replayed, 0);
         assert!(into.join("audit/deltas/delta-0-10.jsonl.gz").exists());
         assert!(into.join("audit/deltas/delta-10-20.jsonl.gz").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── restore config file: target selection ─────────────────────────────
+
+    /// Write `json` to a unique temp file and parse it as a restore config.
+    fn load_config(json: &str) -> BichonResult<RestoreFileConfig> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bichon-restore-config-{}-{seq}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+        RestoreFileConfig::load(&path)
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bichon-restore-target-{}-{tag}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn restore_config_requires_s3_fields_only_for_an_s3_target() {
+        // A file written before local targets existed has no `target_type` and
+        // must still validate exactly as it used to.
+        load_config(r#"{"s3_endpoint":"http://minio:9000","s3_bucket":"bichon"}"#).unwrap();
+        // ...and the S3 branch still demands both fields.
+        assert!(load_config(r#"{"s3_endpoint":"http://minio:9000"}"#).is_err());
+        assert!(load_config(r#"{"s3_bucket":"bichon"}"#).is_err());
+
+        // A local target does not need them, but does need a real directory.
+        let dir = temp_dir("local-config");
+        let json = format!(
+            r#"{{"target_type":"local","local_dir":{}}}"#,
+            serde_json::to_string(&dir.display().to_string()).unwrap()
+        );
+        let cfg = load_config(&json).unwrap();
+        assert_eq!(cfg.target_type, BackupTargetType::Local);
+        assert_eq!(cfg.target_display(), format!("{}/bichon-backup", dir.display()));
+
+        // A local target without a directory is rejected.
+        assert!(load_config(r#"{"target_type":"local"}"#).is_err());
+        // ...and so is one pointing at a directory that is not there.
+        let absent = dir.join("nope");
+        let json = format!(
+            r#"{{"target_type":"local","local_dir":{}}}"#,
+            serde_json::to_string(&absent.display().to_string()).unwrap()
+        );
+        assert!(load_config(&json).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_config_target_display_is_honest_for_both_targets() {
+        let s3 = load_config(r#"{"s3_endpoint":"http://minio:9000","s3_bucket":"bichon"}"#).unwrap();
+        assert_eq!(s3.target_display(), "s3://http://minio:9000/bichon/bichon-backup");
+
+        let dir = temp_dir("display");
+        let json = format!(
+            r#"{{"target_type":"local","local_dir":{},"prefix":"archive"}}"#,
+            serde_json::to_string(&dir.display().to_string()).unwrap()
+        );
+        let local = load_config(&json).unwrap();
+        // The local display must be a real path, never a fabricated `s3://`.
+        assert_eq!(
+            local.target_display(),
+            format!("{}/archive", dir.display())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_restore_engine_dispatches_on_the_target_type() {
+        let dir = temp_dir("dispatch");
+        let local = RestoreOptions {
+            target_type: BackupTargetType::Local,
+            local_dir: Some(dir.clone()),
+            prefix: "archive".to_string(),
+            ..Default::default()
+        };
+        // A local target opens the directory itself.
+        build_restore_engine(&local).unwrap();
+        // ...and a missing directory is refused rather than created.
+        let absent = RestoreOptions {
+            target_type: BackupTargetType::Local,
+            local_dir: Some(dir.join("nope")),
+            ..Default::default()
+        };
+        assert!(build_restore_engine(&absent).is_err());
+        // A local target with no directory at all is a configuration error.
+        let unset = RestoreOptions {
+            target_type: BackupTargetType::Local,
+            ..Default::default()
+        };
+        assert!(build_restore_engine(&unset).is_err());
+        // An S3 target still parses its URI (and fails on a malformed one).
+        let s3 = RestoreOptions {
+            target_type: BackupTargetType::S3,
+            s3_uri: "not-a-uri".to_string(),
+            ..Default::default()
+        };
+        assert!(build_restore_engine(&s3).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The end-to-end shape a local restore actually takes: a config file
+    /// naming a directory, resolved into options, then into an engine that
+    /// finds the restore point the engine wrote there.
+    #[tokio::test]
+    async fn restore_from_a_local_target_config_round_trips() {
+        init_test_env();
+        // The sample manifest carries audit objects, so serialize with the
+        // replayer tests and pin the registry to empty (same reasoning as
+        // `restore_respects_separate_index_and_data_dirs`).
+        let _run_guard = RUN_REPLAY_TESTS.lock().await;
+        {
+            let mut guard = AUDIT_REPLAYERS.lock().unwrap();
+            guard.clear();
+        }
+
+        let root = test_root("local-config-e2e");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store_dir = root.join("backup");
+        let into = root.join("restored");
+
+        let store = BackupEngine::local_store_for_test(&store_dir).unwrap();
+        let engine = BackupEngine::new(store, "bichon-backup");
+        let _hello = engine.upload_bytes_for_test(b"hello").await.unwrap();
+        let committed = sample_manifest(&engine, &root).await;
+        engine.commit(&committed).await.unwrap();
+
+        // Everything from here mirrors `bichon-admin restore --config`: the
+        // target comes from the file, not from anything in memory.
+        let json = format!(
+            r#"{{"target_type":"local","local_dir":{}}}"#,
+            serde_json::to_string(&store_dir.display().to_string()).unwrap()
+        );
+        let file = load_config(&json).unwrap();
+        let opts = RestoreOptions {
+            target_type: file.target_type,
+            s3_uri: file.s3_uri(),
+            local_dir: file.local_dir.as_deref().map(PathBuf::from),
+            prefix: file.prefix.clone(),
+            into: into.clone(),
+            live_root: None,
+            ..Default::default()
+        };
+
+        let built = build_restore_engine(&opts).unwrap();
+        let report = restore_with_engine(&opts, &built).await.unwrap();
+
+        assert_eq!(
+            report.manifest_id, committed.id,
+            "the config file's directory must resolve to the store that wrote the point"
+        );
+        assert!(report.memdb_restored, "the memdb snapshot must land on disk");
+        assert!(
+            into.join("memdb/snapshot.json").exists(),
+            "the restored tree must be populated: {:?}",
+            std::fs::read_dir(&into).map(|d| d
+                .flatten()
+                .map(|e| e.path())
+                .collect::<Vec<_>>())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -36,10 +36,17 @@ use bichon_core::{
     logger,
     migrate::check_data_status,
     raise_error,
-    settings::{cli::SETTINGS, dir::DataDirManager},
+    settings::{
+        cli::SETTINGS,
+        dir::{DataDirManager, DATA_DIR_MANAGER},
+    },
     store::{
         blob::BLOB_MANAGER,
-        tantivy::{attachment::ATTACHMENT_MANAGER, envelope::ENVELOPE_MANAGER},
+        tantivy::{
+            attachment::ATTACHMENT_MANAGER,
+            envelope::ENVELOPE_MANAGER,
+            format::{check_index_format, IndexFormatStatus},
+        },
     },
     tasks::PeriodicTasks,
     users::manager::UserManager,
@@ -114,6 +121,33 @@ pub async fn run() -> BichonResult<()> {
             return Ok(());
         }
         Ok(true) => {}
+    }
+
+    // Search index format gate: a legacy index (no INDEX_FORMAT marker) is
+    // intercepted here with a maintenance page instead of silently serving
+    // searches against terms the new tokenizer can no longer match. A fresh
+    // install reports Fresh and never trips this. Must run before
+    // initialize(), which opens the ENVELOPE/ATTACHMENT/BLOB managers.
+    for dir in [
+        &DATA_DIR_MANAGER.envelope_dir,
+        &DATA_DIR_MANAGER.attachment_dir,
+    ] {
+        if check_index_format(dir) == IndexFormatStatus::NeedsUpgrade {
+            error!("Search index needs a one-time rebuild to fix a known search issue.");
+            rest::maintenance::serve_maintenance(
+                "Community Edition",
+                "Search index rebuild required",
+                &[
+                    "A known issue could make search miss messages that are actually present. Rebuilding the index once fixes it.".to_string(),
+                    "Run `bichon-admin reindex` (Docker: `docker exec -it <bichon-container> bichon-admin reindex`). It prints progress and can take a while on large archives.".to_string(),
+                    "If `bichon_index_dir` / `bichon_data_dir` are customized, pass `--index-parent` / `--data-parent` (or set BICHON_INDEX_DIR / BICHON_DATA_DIR).".to_string(),
+                    "Restart the service once the rebuild has finished (e.g. `docker restart <bichon-container>`).".to_string(),
+                    "Nothing is deleted: the previous indexes are kept aside until you remove them yourself.".to_string(),
+                ],
+            )
+            .await;
+            return Ok(());
+        }
     }
 
     if let Err(error) = initialize().await {

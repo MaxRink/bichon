@@ -37,7 +37,8 @@ use crate::{
                 fields::{
                     F_ACCOUNT_ID, F_ATTACHMENTS, F_ATTACHMENT_CATEGORY, F_ATTACHMENT_CONTENT_TYPE,
                     F_ATTACHMENT_COUNT, F_CONTENT_HASH, F_DATE, F_ENVELOPE_ID, F_FROM, F_HAS_TEXT,
-                    F_ID, F_INGEST_AT, F_INTERNAL_DATE, F_IS_INDEXED, F_IS_MESSAGE, F_IS_OCR,
+                    F_ID, F_IMAP_UID, F_INGEST_AT, F_INTERNAL_DATE, F_IS_INDEXED, F_IS_MESSAGE,
+                    F_IS_OCR,
                     F_MAILBOX_ID, F_MESSAGE_ID, F_PREVIEW, F_REGULAR_ATTACHMENT_COUNT, F_SHARD_ID,
                     F_SIZE, F_SUBJECT, F_TEXT, F_THREAD_ID, F_UID,
                 },
@@ -53,6 +54,35 @@ pub struct EnvelopeWithAttachments {
     pub attachments: Option<Vec<AttachmentInfo>>,
 }
 
+#[cfg(test)]
+mod attachment_storage_tests {
+    use super::*;
+
+    #[test]
+    fn deletion_references_follow_raw_and_legacy_blob_keys() {
+        let envelope = EnvelopeWithAttachments {
+            envelope: Envelope::default(),
+            attachments: Some(vec![
+                AttachmentInfo {
+                    content_hash: "decoded-file".into(),
+                    raw_content_hash: Some("encoded-body".into()),
+                    ..Default::default()
+                },
+                AttachmentInfo {
+                    content_hash: "legacy-body".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let doc = envelope.to_document("", 0).expect("index attachments");
+        let keys: Vec<_> = doc
+            .get_all(SchemaTools::email_fields().f_attachment_content_hash)
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(keys, vec!["encoded-body", "legacy-body"]);
+    }
+}
+
 impl EnvelopeWithAttachments {
     pub fn to_document(&self, body_text: &str, shard_id: u64) -> BichonResult<TantivyDocument> {
         let fields = SchemaTools::email_fields();
@@ -63,24 +93,30 @@ impl EnvelopeWithAttachments {
         doc.add_u64(fields.f_account_id, self.envelope.account_id);
         doc.add_u64(fields.f_mailbox_id, self.envelope.mailbox_id);
         doc.add_u64(fields.f_uid, self.envelope.uid as u64);
+        doc.add_u64(fields.f_imap_uid, self.envelope.imap_uid as u64);
         doc.add_text(fields.f_subject, &self.envelope.subject);
+        doc.add_text(fields.f_subject_tri, &self.envelope.subject);
         doc.add_text(fields.f_preview, &self.envelope.preview);
         doc.add_text(fields.f_content_hash, &self.envelope.content_hash);
         doc.add_text(fields.f_from, &self.envelope.from);
         doc.add_text(fields.f_from_text, &self.envelope.from);
+        doc.add_text(fields.f_from_text_tri, &self.envelope.from);
         doc.add_text(fields.f_body, body_text);
 
         for to in &self.envelope.to {
             doc.add_text(fields.f_to, to);
             doc.add_text(fields.f_to_text, to);
+            doc.add_text(fields.f_to_text_tri, to);
         }
         for cc in &self.envelope.cc {
             doc.add_text(fields.f_cc, cc);
             doc.add_text(fields.f_cc_text, cc);
+            doc.add_text(fields.f_cc_text_tri, cc);
         }
         for bcc in &self.envelope.bcc {
             doc.add_text(fields.f_bcc, bcc);
             doc.add_text(fields.f_bcc_text, bcc);
+            doc.add_text(fields.f_bcc_text_tri, bcc);
         }
 
         doc.add_i64(fields.f_date, self.envelope.date);
@@ -96,6 +132,7 @@ impl EnvelopeWithAttachments {
                 if !att.is_inline() {
                     if let Some(ref filename) = att.filename {
                         doc.add_text(fields.f_attachment_name_text, filename);
+                        doc.add_text(fields.f_attachment_name_text_tri, filename);
                         doc.add_text(fields.f_attachment_name_exact, filename);
                     }
                     if let Some(ext) = att.get_extension() {
@@ -106,7 +143,9 @@ impl EnvelopeWithAttachments {
                     let file_type = att.file_type.to_lowercase();
                     doc.add_text(fields.f_attachment_content_type, file_type);
                 }
-                doc.add_text(fields.f_attachment_content_hash, &att.content_hash);
+                // Blob deletion must follow the encoded storage key, including
+                // shared blobs referenced by other messages and legacy records.
+                doc.add_text(fields.f_attachment_content_hash, att.storage_hash());
             }
         }
 
@@ -160,6 +199,10 @@ impl EnvelopeWithAttachments {
             mailbox_id,
             mailbox_name: Some(mailbox.name),
             uid: extract_u64_field(doc, fields.f_uid, F_UID)? as u32,
+            // Required on purpose: every document written by the current schema
+            // carries it, so a miss means a schema/format mismatch (see
+            // store::tantivy::format) rather than a recoverable gap.
+            imap_uid: extract_u64_field(doc, fields.f_imap_uid, F_IMAP_UID)? as u32,
             subject: extract_string_field(doc, fields.f_subject, F_SUBJECT)?,
             preview: extract_string_field(doc, fields.f_preview, F_PREVIEW).unwrap_or_default(),
             from: extract_string_field(doc, fields.f_from, F_FROM)?,
@@ -359,9 +402,11 @@ impl AttachmentModel {
         doc.add_u64(f.f_account_id, self.account_id);
         doc.add_u64(f.f_mailbox_id, self.mailbox_id);
         doc.add_text(f.f_subject, &self.subject);
+        doc.add_text(f.f_subject_tri, &self.subject);
         doc.add_text(f.f_content_hash, self.content_hash);
         doc.add_text(f.f_from, &self.from);
         doc.add_text(f.f_from_text, &self.from);
+        doc.add_text(f.f_from_text_tri, &self.from);
         doc.add_i64(f.f_date, self.date);
         doc.add_i64(f.f_ingest_at, self.ingest_at);
         doc.add_u64(f.f_size, self.size);
@@ -388,6 +433,7 @@ impl AttachmentModel {
 
         if let Some(name) = self.name {
             doc.add_text(f.f_name_text, name.clone());
+            doc.add_text(f.f_name_text_tri, name.clone());
             doc.add_text(f.f_name_exact, name);
         }
 

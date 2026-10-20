@@ -44,6 +44,7 @@ import i18n from '@/i18n'
 import { KeyRound, Loader2, LogIn, Shield } from 'lucide-react'
 import { ldapLogin, login, mfaVerify, type LoginResult } from '@/api/users/api'
 import { useTheme } from '@/context/theme-context'
+import { isTheme } from '@/lib/theme'
 import { useEdition } from '@/hooks/use-edition'
 
 type UserAuthFormProps = HTMLAttributes<HTMLDivElement>
@@ -52,11 +53,9 @@ function buildOidcLoginUrl(redirectTo: string): string {
   const injectedBase = (window as unknown as { __BICHON_BASE__?: string }).__BICHON_BASE__
   const base = !injectedBase || injectedBase === '/' ? '' : injectedBase.replace(/\/$/, '')
   const params = new URLSearchParams()
-  if (redirectTo && redirectTo !== '/') {
-    params.set('redirect_to', redirectTo)
-  }
-  const qs = params.toString()
-  return `${base}/api/auth/oidc/login${qs ? `?${qs}` : ''}`
+  if (redirectTo && redirectTo !== '/') params.set('redirect_to', redirectTo)
+  const query = params.toString()
+  return `${base}/api/auth/oidc/login${query ? `?${query}` : ''}`
 }
 
 export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
@@ -65,13 +64,13 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   const { setTheme } = useTheme();
   const navigate = useNavigate()
   const { t } = useTranslation()
-  const { oidcEnabled, oidcAutoRedirect, ssoEnabled, ldapEnabled } = useEdition()
-
   const { search } = useLocation();
-  const searchParams = toSearchParams(search);
+  const searchParams = toSearchParams(search)
   const redirect = searchParams.get('redirect') || '/';
-  const localOnly = searchParams.get('local') === '1';
-  const ssoError = searchParams.get('sso_error');
+  const localOnly = searchParams.get('local') === '1'
+  const ssoError = searchParams.get('sso_error')
+
+  const { oidcEnabled, oidcAutoRedirect, ssoEnabled, ldapEnabled } = useEdition()
   // Enterprise LDAP: the form authenticates against the directory (default
   // when enabled); a link lets the user fall back to their local account.
   const [loginMode, setLoginMode] = useState<'local' | 'ldap'>(
@@ -130,7 +129,7 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
     if (result.success && result.access_token) {
       setToken(result);
 
-      if (result.theme) {
+      if (isTheme(result.theme)) {
         setTheme(result.theme);
       }
 
