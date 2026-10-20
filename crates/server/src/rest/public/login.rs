@@ -61,8 +61,10 @@ pub async fn login(payload: Json<LoginPayload>, req: &Request) -> Response {
                 .and_then(|t| AccessTokenModel::resolve_user_from_token(t).ok())
                 .map(|u| u.username)
                 .unwrap_or(login_username);
-            if let Some(ip) = ip {
-                emit(Event::UserLoggedIn { user: username, ip });
+            if result.success && !result.mfa_required {
+                if let Some(ip) = ip {
+                    emit(Event::UserLoggedIn { user: username, ip });
+                }
             }
             match serde_json::to_string(&result) {
                 Ok(json_string) => Response::builder()
