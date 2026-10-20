@@ -58,7 +58,7 @@
     "cmdk": "1.0.4",
     "date-fns": "^3.6.0",
     "file-saver": "^2.0.5",
-    "handlebars": "^4.7.8",
+    "handlebars": "^4.7.10",
     "i18next": "^25.6.3",
     "lucide-react": "^0.468.0",
     "qrcode": "^1.5.4",
