@@ -115,6 +115,12 @@ fn explicit_link_matches_claim(claim_email: &str, configured_email: &str) -> boo
     normalized_email(claim_email) == normalized_email(configured_email)
 }
 
+fn eligible_email_fallback(user: &UserModel, claim_email: &str) -> bool {
+    normalized_email(&user.email) == normalized_email(claim_email)
+        && user.sso_id.is_none()
+        && user.sso_provider.is_none()
+}
+
 fn validate_explicit_oidc_link(
     email: &str,
     link_email: Option<&str>,
@@ -741,23 +747,30 @@ impl BichonUserV2 {
             return Ok(user);
         }
 
-        let email_owned = email.to_string();
-        let matches_by_email =
-            filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| u.email == email_owned)?;
-        if let Some(mut user) = matches_by_email.into_iter().next() {
+        // Email fallback is deliberately fail-closed.  OIDC email claims are
+        // not stable identifiers and must never select an arbitrary account
+        // when duplicate/case-variant local records exist.
+        let email_owned = normalized_email(email);
+        let matches_by_email = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
+            eligible_email_fallback(u, &email_owned)
+        })?;
+        if matches_by_email.len() > 1 {
+            return Err(raise_error!(
+                "OIDC email matches multiple eligible native users; refusing automatic linking".into(),
+                ErrorCode::PermissionDenied
+            ));
+        }
+        if let Some(user) = matches_by_email.into_iter().next() {
             let now = utc_now!();
-            user.sso_id = Some(subject.to_string());
-            user.sso_provider = Some(provider.to_string());
-            user.updated_at = now;
             let provider = provider.to_string();
             let subject = subject.to_string();
-            update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
+            let updated = update_impl(DB_MANAGER.db(), &user.id.to_string(), move |mut current: UserModel| {
                 current.sso_id = Some(subject);
                 current.sso_provider = Some(provider);
-                current.updated_at = utc_now!();
+                current.updated_at = now;
                 Ok(current)
             })?;
-            return Ok(user);
+            return Ok(updated);
         }
 
         let now = utc_now!();
@@ -1320,6 +1333,37 @@ mod tests {
             "subject-1"
         )
         .is_err());
+    }
+
+    #[test]
+    fn email_fallback_matches_trimmed_case_insensitively() {
+        let user = link_target(" Admin@Example.COM ");
+        assert!(eligible_email_fallback(&user, "admin@example.com"));
+    }
+
+    #[test]
+    fn email_fallback_rejects_already_bound_account() {
+        let mut user = link_target("admin@example.com");
+        user.sso_provider = Some("authelia".into());
+        user.sso_id = Some("subject".into());
+        assert!(!eligible_email_fallback(&user, "admin@example.com"));
+    }
+
+    #[test]
+    fn email_fallback_does_not_treat_duplicate_variant_as_unique() {
+        let first = link_target("admin@example.com");
+        let second = link_target(" Admin@Example.COM ");
+        assert!(eligible_email_fallback(&first, "ADMIN@example.com"));
+        assert!(eligible_email_fallback(&second, "ADMIN@example.com"));
+        // Two eligible records would be rejected by the caller's exact-count
+        // check rather than selecting the first database result.
+        assert_eq!(
+            [first, second]
+                .iter()
+                .filter(|u| eligible_email_fallback(u, "ADMIN@example.com"))
+                .count(),
+            2
+        );
     }
 
     #[test]
