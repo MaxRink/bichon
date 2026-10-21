@@ -7,6 +7,13 @@ use bichon_core::{
 use console::{style, Emoji};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 
+fn validate_existing_password(encrypted: &str, encryption_key: &str) -> bool {
+    // Argon2 hashes are already one-way and cannot validate the legacy
+    // encryption key. This preserves the previous behavior for those users.
+    encrypted.starts_with("$argon2id$")
+        || internal_decrypt_string(encryption_key, encrypted).is_ok()
+}
+
 pub fn handle_reset_password(theme: &ColorfulTheme) {
     let root_dir_str: String = Input::with_theme(theme)
         .with_prompt("Enter the absolute path for 'bichon_root_dir'")
@@ -78,7 +85,7 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             .unwrap();
 
         let raw_key = if method == 0 {
-            Input::with_theme(theme)
+            Password::with_theme(theme)
                 .with_prompt("Enter Encryption Password")
                 .interact()
                 .unwrap()
@@ -102,14 +109,16 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             continue;
         }
 
+        // Never echo the encryption key. This command is commonly run in a
+        // terminal or captured by a support transcript, so printing the key
+        // would turn an otherwise protected handoff into a credential leak.
         let prompt_message = format!(
-            "Encryption key loaded: [ {} ]\n\n  \
+            "Encryption key loaded securely.\n\n  \
                 {}: This key must match the database encryption key used by the server.\n  \
                 It corresponds to these settings in your service:\n    \
                 - Arguments: {} or {}\n    \
                 - Envs:      {} or {}\n\n  \
                 Do you want to continue?",
-            style(&raw_key).cyan().bold(),
             style("IMPORTANT").yellow().bold(),
             style("--bichon_encrypt_password").italic(),
             style("--bichon_encrypt_password_file").italic(),
@@ -135,30 +144,33 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             println!("{:<12} : {}", "Username", style(&user.username).cyan());
             println!("{:<12} : {}", "Email", style(&user.email).cyan());
 
+            // Never print the current password. Besides exposing a credential
+            // in the terminal, this command is often captured in support
+            // transcripts. Validate the legacy encrypted value without
+            // retaining or displaying its decrypted contents.
             let pwd_display = match &user.password {
-                Some(p) if p.starts_with("$argon2id$") => {
-                    style("(argon2id hash - cannot be displayed)").dim().italic().to_string()
-                }
-                Some(p) => {
-                    let password = match internal_decrypt_string(&encryption_key, p) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            println!("\n{}", style("ERROR: Decryption Failed").red().bold());
-                            println!(
-                                "{}",
-                                style("The provided encryption key is incorrect or invalid for this database.").yellow()
-                            );
-                            println!(
-                                "{} Please verify your {} or the {} you provided.",
-                                style("➔").cyan(),
-                                style("encryption password").bold(),
-                                style("key file").bold()
-                            );
-                            eprintln!("\nTechnical details: {:?}", e);
-                            std::process::exit(1);
-                        }
-                    };
-                    style(password).yellow().to_string()
+                Some(p) if p.starts_with("$argon2id$") => style("(password hash present - hidden)")
+                    .dim()
+                    .italic()
+                    .to_string(),
+                Some(encrypted) => {
+                    if !validate_existing_password(encrypted, &encryption_key) {
+                        println!(
+                            "\n{}",
+                            style("ERROR: Encryption key validation failed")
+                                .red()
+                                .bold()
+                        );
+                        println!(
+                            "{}",
+                            style("The provided encryption key is incorrect or invalid for this database.").yellow()
+                        );
+                        std::process::exit(1);
+                    }
+                    style("(password present - hidden)")
+                        .dim()
+                        .italic()
+                        .to_string()
                 }
                 None => style("None (No password set)").dim().italic().to_string(),
             };
@@ -247,5 +259,31 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             eprintln!("\nDetails: {:?}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_existing_password;
+    use bichon_core::utils::encrypt::internal_encrypt_string;
+
+    #[test]
+    fn legacy_password_rejects_wrong_encryption_key() {
+        let encrypted = internal_encrypt_string("correct-key", "old-password").unwrap();
+        assert!(!validate_existing_password(&encrypted, "wrong-key"));
+    }
+
+    #[test]
+    fn legacy_password_accepts_correct_encryption_key() {
+        let encrypted = internal_encrypt_string("correct-key", "old-password").unwrap();
+        assert!(validate_existing_password(&encrypted, "correct-key"));
+    }
+
+    #[test]
+    fn argon2_password_skips_legacy_key_validation() {
+        assert!(validate_existing_password(
+            "$argon2id$v=19$test",
+            "irrelevant"
+        ));
     }
 }
