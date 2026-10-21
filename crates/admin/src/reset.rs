@@ -2,9 +2,17 @@ use std::path::{Path, PathBuf};
 
 use bichon_core::{
     admin::meta::{find_admin, open_database, update_admin_password},
+    utils::encrypt::internal_decrypt_string,
 };
 use console::{style, Emoji};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+
+fn validate_existing_password(encrypted: &str, encryption_key: &str) -> bool {
+    // Argon2 hashes are already one-way and cannot validate the legacy
+    // encryption key. This preserves the previous behavior for those users.
+    encrypted.starts_with("$argon2id$")
+        || internal_decrypt_string(encryption_key, encrypted).is_ok()
+}
 
 pub fn handle_reset_password(theme: &ColorfulTheme) {
     let root_dir_str: String = Input::with_theme(theme)
@@ -136,15 +144,34 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             println!("{:<12} : {}", "Username", style(&user.username).cyan());
             println!("{:<12} : {}", "Email", style(&user.email).cyan());
 
-            // Never decrypt or print the current password. Besides exposing a
-            // credential in the terminal, this command is often captured in
-            // support transcripts. The reset operation only needs to validate
-            // the encryption key when saving the new password below.
+            // Never print the current password. Besides exposing a credential
+            // in the terminal, this command is often captured in support
+            // transcripts. Validate the legacy encrypted value without
+            // retaining or displaying its decrypted contents.
             let pwd_display = match &user.password {
-                Some(p) if p.starts_with("$argon2id$") => {
-                    style("(password hash present - hidden)").dim().italic().to_string()
+                Some(p) if p.starts_with("$argon2id$") => style("(password hash present - hidden)")
+                    .dim()
+                    .italic()
+                    .to_string(),
+                Some(encrypted) => {
+                    if !validate_existing_password(encrypted, &encryption_key) {
+                        println!(
+                            "\n{}",
+                            style("ERROR: Encryption key validation failed")
+                                .red()
+                                .bold()
+                        );
+                        println!(
+                            "{}",
+                            style("The provided encryption key is incorrect or invalid for this database.").yellow()
+                        );
+                        std::process::exit(1);
+                    }
+                    style("(password present - hidden)")
+                        .dim()
+                        .italic()
+                        .to_string()
                 }
-                Some(_) => style("(password present - hidden)").dim().italic().to_string(),
                 None => style("None (No password set)").dim().italic().to_string(),
             };
 
@@ -232,5 +259,31 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             eprintln!("\nDetails: {:?}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_existing_password;
+    use bichon_core::utils::encrypt::internal_encrypt_string;
+
+    #[test]
+    fn legacy_password_rejects_wrong_encryption_key() {
+        let encrypted = internal_encrypt_string("correct-key", "old-password").unwrap();
+        assert!(!validate_existing_password(&encrypted, "wrong-key"));
+    }
+
+    #[test]
+    fn legacy_password_accepts_correct_encryption_key() {
+        let encrypted = internal_encrypt_string("correct-key", "old-password").unwrap();
+        assert!(validate_existing_password(&encrypted, "correct-key"));
+    }
+
+    #[test]
+    fn argon2_password_skips_legacy_key_validation() {
+        assert!(validate_existing_password(
+            "$argon2id$v=19$test",
+            "irrelevant"
+        ));
     }
 }
