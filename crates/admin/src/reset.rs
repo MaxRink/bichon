@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use bichon_core::{
     admin::meta::{find_admin, open_database, update_admin_password},
-    utils::encrypt::internal_decrypt_string,
 };
 use console::{style, Emoji};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
@@ -137,31 +136,15 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             println!("{:<12} : {}", "Username", style(&user.username).cyan());
             println!("{:<12} : {}", "Email", style(&user.email).cyan());
 
+            // Never decrypt or print the current password. Besides exposing a
+            // credential in the terminal, this command is often captured in
+            // support transcripts. The reset operation only needs to validate
+            // the encryption key when saving the new password below.
             let pwd_display = match &user.password {
                 Some(p) if p.starts_with("$argon2id$") => {
-                    style("(argon2id hash - cannot be displayed)").dim().italic().to_string()
+                    style("(password hash present - hidden)").dim().italic().to_string()
                 }
-                Some(p) => {
-                    let password = match internal_decrypt_string(&encryption_key, p) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            println!("\n{}", style("ERROR: Decryption Failed").red().bold());
-                            println!(
-                                "{}",
-                                style("The provided encryption key is incorrect or invalid for this database.").yellow()
-                            );
-                            println!(
-                                "{} Please verify your {} or the {} you provided.",
-                                style("➔").cyan(),
-                                style("encryption password").bold(),
-                                style("key file").bold()
-                            );
-                            eprintln!("\nTechnical details: {:?}", e);
-                            std::process::exit(1);
-                        }
-                    };
-                    style(password).yellow().to_string()
-                }
+                Some(_) => style("(password present - hidden)").dim().italic().to_string(),
                 None => style("None (No password set)").dim().italic().to_string(),
             };
 
