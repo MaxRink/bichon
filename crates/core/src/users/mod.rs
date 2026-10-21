@@ -1194,7 +1194,12 @@ impl BichonUserV2 {
     }
 }
 
-fn hash_login_password(password: &str) -> BichonResult<String> {
+/// Hash a login password using the current password storage format.
+///
+/// This is public for administrative tooling that must reset a password
+/// without needing the legacy database encryption key. Callers must never
+/// log or persist the plaintext password outside the password field.
+pub fn hash_login_password(password: &str) -> BichonResult<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -1205,6 +1210,21 @@ fn hash_login_password(password: &str) -> BichonResult<String> {
                 ErrorCode::InternalError
             )
         })
+}
+
+/// Verify a plaintext login password against a stored current-format hash.
+/// Legacy encrypted values are deliberately not accepted here because this
+/// helper is used by password-reset tests and tooling after writing Argon2.
+pub fn verify_login_password(stored: &str, candidate: &str) -> bool {
+    if !stored.starts_with("$argon2id$") {
+        return false;
+    }
+    match PasswordHash::new(stored) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(candidate.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Verify `candidate` against a stored password hash without any of the
