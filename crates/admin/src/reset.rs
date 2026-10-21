@@ -102,14 +102,16 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             continue;
         }
 
+        // Never echo the encryption key. This command is commonly run in a
+        // terminal or captured by a support transcript, so printing the key
+        // would turn an otherwise protected handoff into a credential leak.
         let prompt_message = format!(
-            "Encryption key loaded: [ {} ]\n\n  \
+            "Encryption key loaded securely.\n\n  \
                 {}: This key must match the database encryption key used by the server.\n  \
                 It corresponds to these settings in your service:\n    \
                 - Arguments: {} or {}\n    \
                 - Envs:      {} or {}\n\n  \
                 Do you want to continue?",
-            style(&raw_key).cyan().bold(),
             style("IMPORTANT").yellow().bold(),
             style("--bichon_encrypt_password").italic(),
             style("--bichon_encrypt_password_file").italic(),
