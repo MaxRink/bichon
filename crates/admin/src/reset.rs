@@ -1,11 +1,85 @@
 use std::path::{Path, PathBuf};
 
+use clap::Args;
 use bichon_core::{
-    admin::meta::{find_admin, open_database, update_admin_password},
+    admin::meta::{find_admin, open_database, update_admin_password, update_admin_password_hash},
+    users::hash_login_password,
     utils::encrypt::internal_decrypt_string,
 };
 use console::{style, Emoji};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+
+#[derive(Args, Debug)]
+pub struct ResetPasswordArgs {
+    /// Absolute Bichon root directory containing the `memdb` directory.
+    #[arg(long, value_name = "DIR")]
+    pub root: PathBuf,
+    /// Root-only file containing the new password. The password is never an
+    /// argument and is never printed.
+    #[arg(long, value_name = "FILE")]
+    pub password_file: PathBuf,
+}
+
+fn read_reset_password(path: &Path) -> Result<String, &'static str> {
+    if !path.is_absolute() {
+        return Err("password file path must be absolute");
+    }
+    let metadata = std::fs::metadata(path).map_err(|_| "password file is unavailable")?;
+    if !metadata.is_file() {
+        return Err("password file is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("password file must not be group- or world-readable");
+        }
+    }
+    let password = std::fs::read_to_string(path).map_err(|_| "password file cannot be read")?;
+    let password = password.trim_end_matches(['\r', '\n']).to_owned();
+    if password.is_empty() {
+        return Err("password file is empty");
+    }
+    Ok(password)
+}
+
+fn reset_password_from_file(args: &ResetPasswordArgs) -> Result<(), &'static str> {
+    if !args.root.is_absolute() {
+        return Err("root path must be absolute");
+    }
+    let memdb = args.root.join("memdb");
+    if !memdb.is_dir() {
+        return Err("root path does not contain a memdb directory");
+    }
+    let password = read_reset_password(&args.password_file)?;
+    let database = open_database(&memdb).map_err(|_| "failed to open database")?;
+    if find_admin(&database)
+        .map_err(|_| "failed to query administrator")?
+        .is_none()
+    {
+        return Err("default administrator was not found");
+    }
+    let password_hash = hash_login_password(&password).map_err(|_| "failed to hash password")?;
+    // Keep the plaintext only until hashing has completed, then let it drop
+    // before the database write. The update helper clones the complete record
+    // and replaces only the password field.
+    drop(password);
+    update_admin_password_hash(&database, password_hash)
+        .map_err(|_| "failed to update administrator password")
+}
+
+pub fn run_noninteractive(args: ResetPasswordArgs) -> i32 {
+    match reset_password_from_file(&args) {
+        Ok(()) => {
+            println!("Administrator password updated.");
+            0
+        }
+        Err(message) => {
+            eprintln!("Password reset failed: {message}.");
+            1
+        }
+    }
+}
 
 fn validate_existing_password(encrypted: &str, encryption_key: &str) -> bool {
     // Argon2 hashes are already one-way and cannot validate the legacy
@@ -264,8 +338,16 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_existing_password;
-    use bichon_core::utils::encrypt::internal_encrypt_string;
+    use super::{reset_password_from_file, validate_existing_password, ResetPasswordArgs};
+    use bichon_core::{
+        database::MemDbModel,
+        users::{UserModel, BichonUserV2, DEFAULT_ADMIN_USER_ID},
+        utils::encrypt::internal_encrypt_string,
+    };
+    use argon2::{password_hash::{PasswordHash, PasswordVerifier}, Argon2};
+    use bichon_memdb::{Durability, MemDb};
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn legacy_password_rejects_wrong_encryption_key() {
@@ -285,5 +367,111 @@ mod tests {
             "$argon2id$v=19$test",
             "irrelevant"
         ));
+    }
+
+    #[test]
+    fn file_reset_hashes_password_and_preserves_admin_fields() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("bichon");
+        let memdb = root.join("memdb");
+        fs::create_dir_all(&memdb).unwrap();
+        let before = BichonUserV2 {
+            id: DEFAULT_ADMIN_USER_ID,
+            username: "admin".into(),
+            email: "admin@example.invalid".into(),
+            description: Some("preserve this".into()),
+            global_roles: vec![42],
+            ..Default::default()
+        };
+        {
+            let db = MemDb::open_with(&memdb, Durability::Full).unwrap();
+            db.collection(UserModel::collection())
+                .upsert(before.key(), &before)
+                .unwrap();
+        }
+
+        let password_file = temp.path().join("new-password");
+        fs::write(&password_file, "new-secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&password_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        reset_password_from_file(&ResetPasswordArgs {
+            root: root.clone(),
+            password_file,
+        })
+        .unwrap();
+
+        let db = MemDb::open_with(&memdb, Durability::Full).unwrap();
+        let after: UserModel = db
+            .collection(UserModel::collection())
+            .get_required(&DEFAULT_ADMIN_USER_ID.to_string())
+            .unwrap();
+        assert_eq!(after.username, before.username);
+        assert_eq!(after.email, before.email);
+        assert_eq!(after.description, before.description);
+        assert_eq!(after.global_roles, before.global_roles);
+        let stored = after.password.as_deref().unwrap();
+        let parsed = PasswordHash::new(stored).unwrap();
+        assert!(Argon2::default().verify_password(b"new-secret", &parsed).is_ok());
+        assert!(Argon2::default().verify_password(b"wrong-secret", &parsed).is_err());
+        assert!(!stored.contains("new-secret"));
+    }
+
+    #[test]
+    fn file_reset_rejects_group_readable_password_file() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("bichon");
+        fs::create_dir_all(root.join("memdb")).unwrap();
+        let password_file = temp.path().join("new-password");
+        fs::write(&password_file, "secret").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&password_file, fs::Permissions::from_mode(0o640)).unwrap();
+            let error = reset_password_from_file(&ResetPasswordArgs {
+                root,
+                password_file,
+            })
+            .unwrap_err();
+            assert_eq!(error, "password file must not be group- or world-readable");
+        }
+    }
+
+    #[test]
+    fn file_reset_rejects_missing_password_file() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("bichon");
+        fs::create_dir_all(root.join("memdb")).unwrap();
+
+        let error = reset_password_from_file(&ResetPasswordArgs {
+            root,
+            password_file: temp.path().join("missing-password"),
+        })
+        .unwrap_err();
+        assert_eq!(error, "password file is unavailable");
+    }
+
+    #[test]
+    fn file_reset_rejects_missing_default_administrator() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("bichon");
+        fs::create_dir_all(root.join("memdb")).unwrap();
+        let password_file = temp.path().join("new-password");
+        fs::write(&password_file, "new-secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&password_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let error = reset_password_from_file(&ResetPasswordArgs {
+            root,
+            password_file,
+        })
+        .unwrap_err();
+        assert_eq!(error, "default administrator was not found");
     }
 }

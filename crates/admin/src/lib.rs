@@ -62,6 +62,9 @@ pub enum AdminCommand {
     /// Required after a tokenizer/format change (the old index terms no longer
     /// match new queries). Reads the old indexes as an immutable source.
     Reindex(reindex::ReindexArgs),
+    /// Reset the default administrator password from a protected file,
+    /// without exposing the password in argv or terminal output.
+    ResetPassword(reset::ResetPasswordArgs),
 }
 
 /// Interactive main menu. `verify_only` makes the restore entries run the

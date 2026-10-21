@@ -21,7 +21,7 @@ use std::path::Path;
 use bichon_memdb::{Durability, MemDb};
 
 use crate::{
-    database::MemDbModel,
+    database::{upsert_impl, MemDbModel},
     error::{code::ErrorCode, BichonResult},
     raise_error,
     users::{UserModel, DEFAULT_ADMIN_USER_ID},
@@ -65,4 +65,19 @@ pub fn update_admin_password(
         .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
 
     Ok(())
+}
+
+/// Replace the default administrator's password with a current-format hash.
+/// The existing user record is cloned and only its password field is changed,
+/// so SSO identity, roles, MFA and profile fields remain intact.
+pub fn update_admin_password_hash(db: &MemDb, password_hash: String) -> BichonResult<()> {
+    let key = DEFAULT_ADMIN_USER_ID.to_string();
+    let entity: UserModel = db
+        .collection(UserModel::collection())
+        .get_required(&key)
+        .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+
+    let mut updated = entity;
+    updated.password = Some(password_hash);
+    upsert_impl(db, updated)
 }

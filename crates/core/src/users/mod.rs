@@ -1194,7 +1194,12 @@ impl BichonUserV2 {
     }
 }
 
-fn hash_login_password(password: &str) -> BichonResult<String> {
+/// Hash a login password using the current password storage format.
+///
+/// This is public for administrative tooling that must reset a password
+/// without needing the legacy database encryption key. Callers must never
+/// log or persist the plaintext password.
+pub fn hash_login_password(password: &str) -> BichonResult<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
