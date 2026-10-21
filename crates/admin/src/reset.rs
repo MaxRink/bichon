@@ -341,9 +341,10 @@ mod tests {
     use super::{reset_password_from_file, validate_existing_password, ResetPasswordArgs};
     use bichon_core::{
         database::MemDbModel,
-        users::{verify_login_password, UserModel, BichonUserV2, DEFAULT_ADMIN_USER_ID},
+        users::{UserModel, BichonUserV2, DEFAULT_ADMIN_USER_ID},
         utils::encrypt::internal_encrypt_string,
     };
+    use argon2::{password_hash::{PasswordHash, PasswordVerifier}, Argon2};
     use bichon_memdb::{Durability, MemDb};
     use std::fs;
     use tempfile::tempdir;
@@ -413,8 +414,9 @@ mod tests {
         assert_eq!(after.description, before.description);
         assert_eq!(after.global_roles, before.global_roles);
         let stored = after.password.as_deref().unwrap();
-        assert!(verify_login_password(stored, "new-secret"));
-        assert!(!verify_login_password(stored, "wrong-secret"));
+        let parsed = PasswordHash::new(stored).unwrap();
+        assert!(Argon2::default().verify_password(b"new-secret", &parsed).is_ok());
+        assert!(Argon2::default().verify_password(b"wrong-secret", &parsed).is_err());
         assert!(!stored.contains("new-secret"));
     }
 
@@ -436,5 +438,40 @@ mod tests {
             .unwrap_err();
             assert_eq!(error, "password file must not be group- or world-readable");
         }
+    }
+
+    #[test]
+    fn file_reset_rejects_missing_password_file() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("bichon");
+        fs::create_dir_all(root.join("memdb")).unwrap();
+
+        let error = reset_password_from_file(&ResetPasswordArgs {
+            root,
+            password_file: temp.path().join("missing-password"),
+        })
+        .unwrap_err();
+        assert_eq!(error, "password file is unavailable");
+    }
+
+    #[test]
+    fn file_reset_rejects_missing_default_administrator() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("bichon");
+        fs::create_dir_all(root.join("memdb")).unwrap();
+        let password_file = temp.path().join("new-password");
+        fs::write(&password_file, "new-secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&password_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let error = reset_password_from_file(&ResetPasswordArgs {
+            root,
+            password_file,
+        })
+        .unwrap_err();
+        assert_eq!(error, "default administrator was not found");
     }
 }
