@@ -32,6 +32,7 @@ use crate::{
     id,
     imap::executor::ImapExecutor,
     message::content::AttachmentInfo,
+    metrics,
     raise_error,
     store::{
         blob::{DetachedEmail, BLOB_MANAGER},
@@ -77,20 +78,26 @@ pub async fn extract_envelope_and_store_it(
                 uid = fetch.uid,
                 "FETCH response has no body, skipping message"
             );
+            // The message was not archived, so it counts as a failed ingest.
+            metrics::count_email_ingested(account_id, "imap", "failed");
             return Ok(());
         }
     };
     let size = fetch.size.unwrap_or(body.len() as u32);
-    extract_envelope_core(
-        body,
-        uid,
-        size,
-        internal_date,
+    record_ingest_outcome(
         account_id,
-        mailbox_id,
-        None,
+        "imap",
+        extract_envelope_core(
+            body,
+            uid,
+            size,
+            internal_date,
+            account_id,
+            mailbox_id,
+            None,
+        )
+        .await,
     )
-    .await
     .map(|_| ())
 }
 
@@ -100,7 +107,11 @@ pub async fn extract_envelope_from_eml(
     mailbox_id: u64,
 ) -> BichonResult<ExtractOutcome> {
     let _write_guard = WRITE_GATE.acquire(BACKUP_ACQUIRE_TIMEOUT).await?;
-    extract_envelope_core(body, 0, body.len() as u32, 0, account_id, mailbox_id, None).await
+    record_ingest_outcome(
+        account_id,
+        "import",
+        extract_envelope_core(body, 0, body.len() as u32, 0, account_id, mailbox_id, None).await,
+    )
 }
 
 pub async fn extract_envelope_from_smtp(
@@ -109,16 +120,20 @@ pub async fn extract_envelope_from_smtp(
     mailbox_id: u64,
 ) -> BichonResult<ExtractOutcome> {
     let _write_guard = WRITE_GATE.acquire(BACKUP_ACQUIRE_TIMEOUT).await?;
-    extract_envelope_core(
-        body,
-        0,
-        body.len() as u32,
-        utc_now!(),
+    record_ingest_outcome(
         account_id,
-        mailbox_id,
-        None,
+        "smtp",
+        extract_envelope_core(
+            body,
+            0,
+            body.len() as u32,
+            utc_now!(),
+            account_id,
+            mailbox_id,
+            None,
+        )
+        .await,
     )
-    .await
 }
 
 /// Archive a journal delivery: `inner` is the original message the journal
@@ -144,16 +159,40 @@ pub async fn extract_envelope_from_journal(
     let _write_guard = WRITE_GATE.acquire(BACKUP_ACQUIRE_TIMEOUT).await?;
     // `size` describes the archived message (the inner one); the report is a
     // separate attachment and has its own size.
-    extract_envelope_core(
-        inner,
-        0,
-        inner.len() as u32,
-        utc_now!(),
+    record_ingest_outcome(
         account_id,
-        mailbox_id,
-        report,
+        "journal",
+        extract_envelope_core(
+            inner,
+            0,
+            inner.len() as u32,
+            utc_now!(),
+            account_id,
+            mailbox_id,
+            report,
+        )
+        .await,
     )
-    .await
+}
+
+/// Count one ingestion attempt by its final outcome, then hand the result
+/// back unchanged. The counter helpers are infallible, so this never alters
+/// the ingest path's behavior.
+fn record_ingest_outcome(
+    account_id: u64,
+    source: &str,
+    result: BichonResult<ExtractOutcome>,
+) -> BichonResult<ExtractOutcome> {
+    match &result {
+        Ok(ExtractOutcome::Imported) => {
+            metrics::count_email_ingested(account_id, source, "imported")
+        }
+        Ok(ExtractOutcome::Duplicate) => {
+            metrics::count_email_ingested(account_id, source, "duplicate")
+        }
+        Err(_) => metrics::count_email_ingested(account_id, source, "failed"),
+    }
+    result
 }
 
 /// If `raw` is a journal report that wraps the original message in a

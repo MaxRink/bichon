@@ -605,6 +605,12 @@
       "save": "Save",
       "saveChanges": "Save Changes"
     },
+    "filters": {
+      "all": "All tokens",
+      "label": "Filter",
+      "metricsOnly": "Metrics only",
+      "regular": "Regular tokens"
+    },
     "form": {
       "1day": "1 day",
       "30days": "30 days",
@@ -616,6 +622,8 @@
       "expirationDescription": "Tokens will automatically expire after the selected time.",
       "expirationLabel": "Expiration",
       "expirationPlaceholder": "Select expiration",
+      "metricsOnlyDescription": "The token can only call GET /api/v1/metrics and is rejected on every other endpoint. The owner must hold the system:metrics permission.",
+      "metricsOnlyLabel": "Metrics endpoint only",
       "nameDescription": "Optional · Max 32 characters",
       "nameLabel": "Name",
       "namePlaceholder": "Give this access token a short name",
@@ -626,7 +634,9 @@
       "deleteBtn": "Delete token",
       "expiresOnLabel": "Expires on",
       "expiresOnShort": "Expires on {{date}}",
+      "filterEmpty": "No tokens match this filter.",
       "lastUsedLabel": "Last used",
+      "metricsOnlyBadge": "Metrics only",
       "neverExpires": "Never expires",
       "neverLabel": "Never",
       "neverUsed": "Never",
@@ -1935,6 +1945,7 @@
     },
     "system": {
       "access": "Basic System Access",
+      "metrics": "Read Server Metrics (Prometheus endpoint)",
       "root": "Root System Control"
     },
     "timestamp": {

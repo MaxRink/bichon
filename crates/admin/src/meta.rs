@@ -640,6 +640,8 @@ impl From<AccessTokenModel> for bichon_core::token::AccessTokenModel {
             updated_at: value.updated_at,
             expire_at: value.expire_at,
             last_access_at: value.last_access_at,
+            // Legacy tokens predate the metrics-only scope.
+            metrics_only: false,
         }
     }
 }

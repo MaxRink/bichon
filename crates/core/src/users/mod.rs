@@ -372,6 +372,7 @@ impl BichonUserV2 {
                 user_id: DEFAULT_ADMIN_USER_ID,
                 token_type: TokenType::WebUI,
                 expire_at: None, // Admin setup token usually persistent until changed
+                metrics_only: false,
             };
 
             with_transaction(DB_MANAGER.db(), move |txn| {
@@ -708,6 +709,7 @@ impl BichonUserV2 {
             user_id: user.id,
             token_type: TokenType::WebUI,
             expire_at: None,
+            metrics_only: false,
         };
 
         with_transaction(DB_MANAGER.db(), move |txn| {

@@ -72,6 +72,11 @@ pub async fn run() -> BichonResult<()> {
     info!("Git:      [{}]", env!("GIT_HASH"));
     info!("GitHub:   https://github.com/rustmailer/bichon");
 
+    // Register the community metric families and start the uptime clock now,
+    // so `bichon_uptime_seconds` measures the real process uptime rather than
+    // the time since the first scrape.
+    bichon_core::metrics::init();
+
     // Disaster recovery (`restore`) lives in the `bichon-admin` tool, not
     // here: a fresh box has no data root yet, and this binary requires one
     // at the clap level (the non-optional `bichon_root_dir` field) before

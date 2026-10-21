@@ -27,6 +27,7 @@ import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from '@/hooks/use-toast';
 import { formatBytes } from '@/lib/utils';
+import { copyToClipboard } from '@/lib/clipboard';
 import EmailIframe from '@/components/mail-iframe';
 import {
   AttachmentInfo,
@@ -264,7 +265,7 @@ export function MailMessageView({
   // a user picks it up — the row is a dense one-liner, hence the icon button.
   const copyEnvelopeId = async () => {
     try {
-      await navigator.clipboard.writeText(envelope.id);
+      await copyToClipboard(envelope.id);
       toast({ title: t('mail.copied') });
     } catch {
       toast({ title: t('mail.copyFailed'), variant: 'destructive' });

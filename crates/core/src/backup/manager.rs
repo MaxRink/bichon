@@ -315,6 +315,7 @@ impl BackupManager {
         });
 
         let elapsed = finished_at - started_at;
+        crate::metrics::record_backup_run(status == BackupRunStatus::Success, elapsed);
         match status {
             BackupRunStatus::Success => {
                 info!("backup: run ({trigger}) succeeded in {elapsed}ms");

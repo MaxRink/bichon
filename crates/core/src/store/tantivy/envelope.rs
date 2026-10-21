@@ -17,7 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Bound,
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -1203,6 +1203,44 @@ impl IndexManager {
             Some(_) => Ok(0),
             None => Ok(searcher.num_docs()),
         }
+    }
+
+    /// Total archived emails grouped by account id. One aggregation over the
+    /// whole index instead of one query per account, so the metrics endpoint
+    /// can refresh per-account gauges in a single pass.
+    pub fn total_emails_by_account(&self) -> BichonResult<BTreeMap<u64, u64>> {
+        let searcher = self.create_searcher()?;
+
+        // The terms aggregation needs a bucket limit; this is far above any
+        // realistic number of accounts on one server (and far below a size
+        // that would make the collector allocate excessively).
+        const MAX_ACCOUNT_BUCKETS: usize = 10_000;
+        let aggregations: Aggregations = serde_json::from_value(json!({
+            "by_account": {
+                "terms": {
+                    "field": F_ACCOUNT_ID,
+                    "size": MAX_ACCOUNT_BUCKETS
+                }
+            }
+        }))
+        .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+
+        let collector = AggregationCollector::from_aggs(aggregations, Default::default());
+        let agg_results = searcher
+            .search(&AllQuery, &collector)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+
+        let mut counts = BTreeMap::new();
+        if let Some(AggregationResult::BucketResult(BucketResult::Terms { buckets, .. })) =
+            agg_results.0.get("by_account")
+        {
+            for entry in buckets {
+                if let Key::U64(account_id) = &entry.key {
+                    counts.insert(*account_id, entry.doc_count);
+                }
+            }
+        }
+        Ok(counts)
     }
 
     pub fn get_max_uid(&self, account_id: u64, mailbox_id: u64) -> BichonResult<Option<u64>> {
