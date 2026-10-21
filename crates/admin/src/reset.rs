@@ -85,7 +85,7 @@ pub fn handle_reset_password(theme: &ColorfulTheme) {
             .unwrap();
 
         let raw_key = if method == 0 {
-            Input::with_theme(theme)
+            Password::with_theme(theme)
                 .with_prompt("Enter Encryption Password")
                 .interact()
                 .unwrap()
