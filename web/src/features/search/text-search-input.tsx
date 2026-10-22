@@ -161,7 +161,7 @@ export function TextSearchInput() {
                         onFocus={() => setShowHistory(true)}
                         onKeyDown={(e) => e.key === "Enter" && handleSearch()}
                         placeholder={t("search_input.placeholder")}
-                        className="h-9 border-none shadow-none focus-visible:ring-0 pl-9 pr-10 text-sm bg-transparent w-full"
+                        className="h-9 border-none shadow-none focus-visible:ring-0 pl-9 pr-10 text-xs md:text-xs bg-transparent w-full"
                     />
                     {value && (
                         <Button

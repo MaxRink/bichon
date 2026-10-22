@@ -18,6 +18,7 @@ import { Route as AuthenticatedIndexImport } from './routes/_authenticated/index
 import { Route as authSignInImport } from './routes/(auth)/sign-in'
 import { Route as auth500Import } from './routes/(auth)/500'
 import { Route as AuthenticatedSearchIndexImport } from './routes/_authenticated/search/index'
+import { Route as AuthenticatedMailboxIndexImport } from './routes/_authenticated/mailbox/index'
 import { Route as AuthenticatedImportIndexImport } from './routes/_authenticated/import/index'
 import { Route as AuthenticatedExportsIndexImport } from './routes/_authenticated/exports/index'
 import { Route as AuthenticatedBackupIndexImport } from './routes/_authenticated/backup/index'
@@ -353,6 +354,12 @@ const AuthenticatedAccountsIndexLazyRoute =
 const AuthenticatedSearchIndexRoute = AuthenticatedSearchIndexImport.update({
   id: '/search/',
   path: '/search/',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
+
+const AuthenticatedMailboxIndexRoute = AuthenticatedMailboxIndexImport.update({
+  id: '/mailbox/',
+  path: '/mailbox/',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
 
@@ -840,6 +847,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedImportIndexImport
       parentRoute: typeof AuthenticatedRouteImport
     }
+    '/_authenticated/mailbox/': {
+      id: '/_authenticated/mailbox/'
+      path: '/mailbox'
+      fullPath: '/mailbox'
+      preLoaderRoute: typeof AuthenticatedMailboxIndexImport
+      parentRoute: typeof AuthenticatedRouteImport
+    }
     '/_authenticated/search/': {
       id: '/_authenticated/search/'
       path: '/search'
@@ -979,6 +993,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedBackupIndexRoute: typeof AuthenticatedBackupIndexRoute
   AuthenticatedExportsIndexRoute: typeof AuthenticatedExportsIndexRoute
   AuthenticatedImportIndexRoute: typeof AuthenticatedImportIndexRoute
+  AuthenticatedMailboxIndexRoute: typeof AuthenticatedMailboxIndexRoute
   AuthenticatedSearchIndexRoute: typeof AuthenticatedSearchIndexRoute
   AuthenticatedAccountsIndexLazyRoute: typeof AuthenticatedAccountsIndexLazyRoute
   AuthenticatedOauth2ResultIndexLazyRoute: typeof AuthenticatedOauth2ResultIndexLazyRoute
@@ -1008,6 +1023,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedBackupIndexRoute: AuthenticatedBackupIndexRoute,
   AuthenticatedExportsIndexRoute: AuthenticatedExportsIndexRoute,
   AuthenticatedImportIndexRoute: AuthenticatedImportIndexRoute,
+  AuthenticatedMailboxIndexRoute: AuthenticatedMailboxIndexRoute,
   AuthenticatedSearchIndexRoute: AuthenticatedSearchIndexRoute,
   AuthenticatedAccountsIndexLazyRoute: AuthenticatedAccountsIndexLazyRoute,
   AuthenticatedOauth2ResultIndexLazyRoute:
@@ -1060,6 +1076,7 @@ export interface FileRoutesByFullPath {
   '/backup': typeof AuthenticatedBackupIndexRoute
   '/exports': typeof AuthenticatedExportsIndexRoute
   '/import': typeof AuthenticatedImportIndexRoute
+  '/mailbox': typeof AuthenticatedMailboxIndexRoute
   '/search': typeof AuthenticatedSearchIndexRoute
   '/accounts': typeof AuthenticatedAccountsIndexLazyRoute
   '/oauth2-result': typeof AuthenticatedOauth2ResultIndexLazyRoute
@@ -1106,6 +1123,7 @@ export interface FileRoutesByTo {
   '/backup': typeof AuthenticatedBackupIndexRoute
   '/exports': typeof AuthenticatedExportsIndexRoute
   '/import': typeof AuthenticatedImportIndexRoute
+  '/mailbox': typeof AuthenticatedMailboxIndexRoute
   '/search': typeof AuthenticatedSearchIndexRoute
   '/accounts': typeof AuthenticatedAccountsIndexLazyRoute
   '/oauth2-result': typeof AuthenticatedOauth2ResultIndexLazyRoute
@@ -1157,6 +1175,7 @@ export interface FileRoutesById {
   '/_authenticated/backup/': typeof AuthenticatedBackupIndexRoute
   '/_authenticated/exports/': typeof AuthenticatedExportsIndexRoute
   '/_authenticated/import/': typeof AuthenticatedImportIndexRoute
+  '/_authenticated/mailbox/': typeof AuthenticatedMailboxIndexRoute
   '/_authenticated/search/': typeof AuthenticatedSearchIndexRoute
   '/_authenticated/accounts/': typeof AuthenticatedAccountsIndexLazyRoute
   '/_authenticated/oauth2-result/': typeof AuthenticatedOauth2ResultIndexLazyRoute
@@ -1208,6 +1227,7 @@ export interface FileRouteTypes {
     | '/backup'
     | '/exports'
     | '/import'
+    | '/mailbox'
     | '/search'
     | '/accounts'
     | '/oauth2-result'
@@ -1253,6 +1273,7 @@ export interface FileRouteTypes {
     | '/backup'
     | '/exports'
     | '/import'
+    | '/mailbox'
     | '/search'
     | '/accounts'
     | '/oauth2-result'
@@ -1302,6 +1323,7 @@ export interface FileRouteTypes {
     | '/_authenticated/backup/'
     | '/_authenticated/exports/'
     | '/_authenticated/import/'
+    | '/_authenticated/mailbox/'
     | '/_authenticated/search/'
     | '/_authenticated/accounts/'
     | '/_authenticated/oauth2-result/'
@@ -1374,6 +1396,7 @@ export const routeTree = rootRoute
         "/_authenticated/backup/",
         "/_authenticated/exports/",
         "/_authenticated/import/",
+        "/_authenticated/mailbox/",
         "/_authenticated/search/",
         "/_authenticated/accounts/",
         "/_authenticated/oauth2-result/",
@@ -1549,6 +1572,10 @@ export const routeTree = rootRoute
     },
     "/_authenticated/import/": {
       "filePath": "_authenticated/import/index.tsx",
+      "parent": "/_authenticated"
+    },
+    "/_authenticated/mailbox/": {
+      "filePath": "_authenticated/mailbox/index.tsx",
       "parent": "/_authenticated"
     },
     "/_authenticated/search/": {
