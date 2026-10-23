@@ -128,6 +128,7 @@ pub struct LoginResult {
 }
 
 pub const DEFAULT_ADMIN_USER_ID: u64 = 100000000000000;
+pub const DEFAULT_ADMIN_PASSWORD: &str = "admin@bichon";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BichonUserV2 {
@@ -1176,6 +1177,7 @@ fn hash_login_password(password: &str) -> BichonResult<String> {
 mod tests {
     use super::*;
     use crate::after_n_days_timestamp;
+    use std::sync::LazyLock;
 
     const NOW: i64 = 1_700_000_000_000;
 
