@@ -53,6 +53,7 @@ pub mod view;
 
 pub type UserModel = BichonUserV2;
 
+
 fn derive_username_base(email: &str, display_name: Option<&str>) -> String {
     if let Some(name) = display_name.map(str::trim).filter(|s| !s.is_empty()) {
         let sanitized: String = name
@@ -207,6 +208,18 @@ impl MemDbModel for BichonUserV2 {
 }
 
 impl BichonUserV2 {
+    /// Read-only startup reminder check; never mutates login bookkeeping.
+    pub fn default_admin_password_active() -> bool {
+        match Self::find(DEFAULT_ADMIN_USER_ID) {
+            Ok(Some(user)) => match user.password.as_deref() {
+                Some(stored) => PasswordHash::new(stored)
+                    .ok()
+                    .is_some_and(|hash| Argon2::default().verify_password(DEFAULT_ADMIN_PASSWORD.as_bytes(), &hash).is_ok()),
+                None => false,
+            },
+            _ => false,
+        }
+    }
     pub fn is_using_role(&self, role_id: u64) -> bool {
         if self.global_roles.contains(&role_id) {
             return true;
