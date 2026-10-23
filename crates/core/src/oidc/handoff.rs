@@ -102,5 +102,3 @@ impl OidcHandoffEntity {
         Ok(())
     }
 }
-
-
