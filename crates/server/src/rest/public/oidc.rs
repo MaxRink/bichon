@@ -113,27 +113,13 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
 
     let claims = result.claims;
 
-    // Never use an unverified (or absent) email claim to link a new OIDC
-    // identity to an existing password account. A pre-linked identity is
-    // still allowed to log in when an IdP omits email_verified: its binding is
-    // already keyed by the verified issuer/subject pair.
-    let email = match verified_email(&claims) {
-        Some(email) => email.to_string(),
-        None => match UserModel::find_sso_user(OIDC_PROVIDER_ID, &claims.sub) {
-            Ok(Some(user)) => user.email,
-            Ok(None) => {
-                warn!(subject = %claims.sub, "OIDC login rejected because email_verified was not true and subject was not pre-linked");
-                return Ok(redirect_login_error(
-                    "OIDC provider did not verify the email claim; ask an administrator to pre-link this account",
-                ));
-            }
-            Err(e) => {
-                error!("Failed to resolve pre-linked OIDC user: {}", e);
-                return Ok(redirect_login_error(
-                    "Failed to resolve Bichon user for OIDC subject. See server logs.",
-                ));
-            }
-        },
+    let email = match claims.email.as_deref() {
+        Some(e) if !e.is_empty() => e,
+        _ => {
+            return Ok(redirect_login_error(
+                "OIDC provider did not return an email claim; cannot log in",
+            ));
+        }
     };
 
     let display_name = claims
@@ -145,7 +131,7 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
     let user = match UserModel::find_or_provision_sso_user(
         OIDC_PROVIDER_ID,
         &claims.sub,
-        &email,
+        email,
         display_name,
         claims.preferred_username.as_deref(),
         SETTINGS.bichon_oidc_link_username.as_deref(),
@@ -272,15 +258,6 @@ fn sanitize_redirect(input: Option<String>) -> Option<String> {
             None
         }
     })
-}
-
-/// Return an email only when the provider explicitly asserted ownership.
-/// The value is used for linking an existing local account, so a present email
-/// claim without `email_verified=true` is deliberately insufficient.
-fn verified_email(claims: &bichon_core::oidc::id_token::IdTokenClaims) -> Option<&str> {
-    (claims.email_verified == Some(true))
-        .then_some(claims.email.as_deref().filter(|email| !email.is_empty()))
-        .flatten()
 }
 
 fn redirect_login_error(message: &str) -> Response {

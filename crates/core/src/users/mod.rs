@@ -39,10 +39,7 @@ use argon2::{
     Argon2,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    sync::{LazyLock, Mutex},
-};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
@@ -56,11 +53,6 @@ pub mod view;
 
 pub type UserModel = BichonUserV2;
 
-// SSO binding is a read-then-write operation. Bichon runs as one server
-// process, so serialize callbacks to prevent two first logins from both
-// linking the same email or replacing each other's subject between the
-// lookup and update.
-static SSO_BINDING_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn derive_username_base(email: &str, display_name: Option<&str>) -> String {
     if let Some(name) = display_name.map(str::trim).filter(|s| !s.is_empty()) {
@@ -136,11 +128,6 @@ pub struct LoginResult {
 }
 
 pub const DEFAULT_ADMIN_USER_ID: u64 = 100000000000000;
-
-/// Username of the default administrator created on first startup.
-pub const DEFAULT_ADMIN_USERNAME: &str = "admin";
-
-/// Initial administrator password used only for the startup reminder.
 pub const DEFAULT_ADMIN_PASSWORD: &str = "admin@bichon";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -222,6 +209,18 @@ impl MemDbModel for BichonUserV2 {
 }
 
 impl BichonUserV2 {
+    /// Read-only startup reminder check; never mutates login bookkeeping.
+    pub fn default_admin_password_active() -> bool {
+        match Self::find(DEFAULT_ADMIN_USER_ID) {
+            Ok(Some(user)) => match user.password.as_deref() {
+                Some(stored) => PasswordHash::new(stored)
+                    .ok()
+                    .is_some_and(|hash| Argon2::default().verify_password(DEFAULT_ADMIN_PASSWORD.as_bytes(), &hash).is_ok()),
+                None => false,
+            },
+            _ => false,
+        }
+    }
     pub fn is_using_role(&self, role_id: u64) -> bool {
         if self.global_roles.contains(&role_id) {
             return true;
@@ -289,11 +288,9 @@ impl BichonUserV2 {
     }
 
     pub fn to_view(self, role_lookup: &BTreeMap<u64, UserRole>) -> UserView {
-        let live_global_roles = self.effective_global_roles();
         let global_roles_names = self
             .global_roles
             .iter()
-            .filter(|role_id| live_global_roles.contains(role_id))
             .filter_map(|role_id| role_lookup.get(role_id))
             .map(|role| role.name.clone())
             .collect();
@@ -371,7 +368,7 @@ impl BichonUserV2 {
             account_access_map: self.account_access_map,
             account_roles_summary,
             description: self.description,
-            global_roles: live_global_roles,
+            global_roles: self.global_roles,
             global_roles_names,
             global_role_expiries: live_global,
             account_role_expiries: live_scoped,
@@ -402,9 +399,9 @@ impl BichonUserV2 {
             // 2. Insert the BichonUser with the updated schema
             let user = UserModel {
                 id: DEFAULT_ADMIN_USER_ID,
-                username: DEFAULT_ADMIN_USERNAME.into(),
+                username: "admin".into(),
                 email: "placeholder@example.com".into(),
-                password: Some(hash_login_password(DEFAULT_ADMIN_PASSWORD)?),
+                password: Some(hash_login_password("admin@bichon")?),
 
                 // Use global_roles as defined in our new schema
                 global_roles: vec![DEFAULT_ADMIN_ROLE_ID],
@@ -591,32 +588,6 @@ impl BichonUserV2 {
         find_impl::<UserModel>(DB_MANAGER.db(), &user_id.to_string())
     }
 
-    /// Read-only check used by the admin security reminder.
-    pub fn default_admin_password_active() -> bool {
-        match Self::find(DEFAULT_ADMIN_USER_ID) {
-            Ok(Some(user)) => match user.password.as_deref() {
-                Some(stored) => stored_password_matches(stored, DEFAULT_ADMIN_PASSWORD),
-                None => false,
-            },
-            _ => false,
-        }
-    }
-
-    /// Find an already-linked SSO identity without requiring an email claim.
-    /// This lets a pre-linked user sign in even when the provider omits
-    /// `email_verified`, while still forbidding email-based account linking
-    /// without that assertion in the OIDC handler.
-    pub fn find_sso_user(provider: &str, subject: &str) -> BichonResult<Option<UserModel>> {
-        let provider_owned = provider.to_string();
-        let subject_owned = subject.to_string();
-        Ok(filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
-            u.sso_id.as_deref() == Some(&subject_owned)
-                && u.sso_provider.as_deref() == Some(&provider_owned)
-        })?
-        .into_iter()
-        .next())
-    }
-
     /// Resolve or auto-provision a Bichon user for an OIDC login.
     ///
     /// Resolution order:
@@ -636,12 +607,6 @@ impl BichonUserV2 {
         link_subject: Option<&str>,
         default_role_id: u64,
     ) -> BichonResult<UserModel> {
-        let _binding_guard = SSO_BINDING_LOCK.lock().map_err(|_| {
-            raise_error!(
-                "OIDC identity binding lock is poisoned".into(),
-                ErrorCode::InternalError
-            )
-        })?;
         let subject_owned = subject.to_string();
         let provider_owned = provider.to_string();
 
@@ -730,22 +695,6 @@ impl BichonUserV2 {
             ));
         }
         if let Some(mut user) = matches_by_email.into_iter().next() {
-            // An email match is only a safe migration path for a local user
-            // that has not already been bound to another SSO identity.  Do
-            // not silently replace a different subject/provider: the OIDC
-            // handler requires email_verified=true, but a verified address
-            // alone must never let one IdP identity take over another.
-            if user.sso_id.as_deref().is_some_and(|id| id != subject)
-                || user
-                    .sso_provider
-                    .as_deref()
-                    .is_some_and(|bound_provider| bound_provider != provider)
-            {
-                return Err(raise_error!(
-                    "OIDC email is already bound to a different SSO identity".into(),
-                    ErrorCode::PermissionDenied
-                ));
-            }
             let now = utc_now!();
             user.sso_id = Some(subject.to_string());
             user.sso_provider = Some(provider.to_string());
@@ -1222,26 +1171,11 @@ fn hash_login_password(password: &str) -> BichonResult<String> {
         .map_err(|_| raise_error!("Failed to hash password.".into(), ErrorCode::InternalError))
 }
 
-fn stored_password_matches(stored: &str, candidate: &str) -> bool {
-    if stored.starts_with("$argon2id$") {
-        match PasswordHash::new(stored) {
-            Ok(parsed) => Argon2::default()
-                .verify_password(candidate.as_bytes(), &parsed)
-                .is_ok(),
-            Err(_) => false,
-        }
-    } else {
-        match decrypt!(stored) {
-            Ok(decrypted) => bool::from(candidate.as_bytes().ct_eq(decrypted.as_bytes())),
-            Err(_) => false,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::after_n_days_timestamp;
+    use std::sync::LazyLock;
 
     const NOW: i64 = 1_700_000_000_000;
 

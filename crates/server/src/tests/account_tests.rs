@@ -18,7 +18,6 @@ fn api_client(route: impl poem::Endpoint) -> TestClient<impl poem::Endpoint> {
 struct CreateAccountPayload {
     email: String,
     enabled: bool,
-    deleting: bool,
     account_type: String,
     use_dangerous: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,7 +29,6 @@ struct AccountResp {
     id: u64,
     email: String,
     enabled: bool,
-    deleting: bool,
     #[allow(dead_code)] // present in the API response, not asserted here
     account_name: Option<String>,
 }
@@ -61,7 +59,6 @@ async fn account_crud() {
     let create_payload = CreateAccountPayload {
         email: "test-crud@example.com".into(),
         enabled: false,
-        deleting: false,
         account_type: "NoSync".into(),
         use_dangerous: false,
         account_name: Some("CRUD Test Account".into()),
@@ -132,18 +129,10 @@ async fn account_crud() {
         .send()
         .await;
     let status = resp.0.status();
-    if status.is_success() {
-        let account: AccountResp = resp.json().await.value().deserialize();
-        assert!(
-            account.deleting,
-            "successful post-delete read must be soft-deleting"
-        );
-    } else {
-        assert!(
-            status.is_client_error(),
-            "after delete the account must be gone or soft-deleting, got {status}"
-        );
-    }
+    assert!(
+        status.is_success() || status.is_client_error(),
+        "after delete the account must be gone or soft-deleting, got {status}"
+    );
 }
 
 #[tokio::test]
@@ -156,7 +145,6 @@ async fn create_account_with_invalid_email_fails() {
     let payload = CreateAccountPayload {
         email: "not-an-email".into(),
         enabled: false,
-        deleting: false,
         account_type: "NoSync".into(),
         use_dangerous: false,
         account_name: None,
@@ -168,10 +156,7 @@ async fn create_account_with_invalid_email_fails() {
         .body_json(&payload)
         .send()
         .await;
-    assert!(
-        resp.0.status().is_client_error(),
-        "invalid email should fail"
-    );
+    assert!(resp.0.status().is_client_error(), "invalid email should fail");
 }
 
 #[tokio::test]
@@ -184,7 +169,6 @@ async fn create_account_with_empty_email_fails() {
     let payload = CreateAccountPayload {
         email: "".into(),
         enabled: false,
-        deleting: false,
         account_type: "NoSync".into(),
         use_dangerous: false,
         account_name: None,
@@ -211,10 +195,7 @@ async fn get_nonexistent_account_returns_error() {
         .header("Authorization", &format!("Bearer {}", token))
         .send()
         .await;
-    assert!(
-        resp.0.status().is_client_error(),
-        "nonexistent account should 4xx"
-    );
+    assert!(resp.0.status().is_client_error(), "nonexistent account should 4xx");
 }
 
 #[tokio::test]

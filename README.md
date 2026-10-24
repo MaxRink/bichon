@@ -26,9 +26,6 @@
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-AGPLv3-blue.svg" alt="License">
   </a>
-  <a href="https://deepwiki.com/rustmailer/bichon">
-    <img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki">
-  </a>
   <a href="https://discord.gg/Bq4M2cDmF4">
     <img src="https://img.shields.io/badge/Discord-Join%20Server-7289DA?logo=discord&logoColor=white" alt="Discord">
   </a>
@@ -99,10 +96,6 @@
 - **OpenAPI 3.0**: Interactive API documentation at `/api-docs` (Swagger UI, ReDoc, Scalar). All endpoints documented with request/response schemas.
 - **Multi-User RBAC**: 5 built-in roles (Admin, Manager, Member, AccountManager, AccountViewer) plus custom roles with 22 granular permissions.
 - **Account-Level Isolation**: Grant users access to specific accounts with scoped roles. Permissions enforced at the API layer.
-- **OIDC SSO (MaxRink fork)**: Authorization-code flow with PKCE, nonce and
-  JWKS ID-token verification. Auto-provisioning defaults to the built-in Member
-  role; an existing local account is linked only when the IdP asserts
-  `email_verified=true` and it is not already bound to another SSO identity.
 - **CLI & WebUI Import Tools**: Import from EML directories, MBOX files (including Gmail variants), Thunderbird profiles, and Outlook PST files via CLI. Import EML files directly from the WebUI.
 - **CLI Export**: Download account data as MBOX via `bichon-cli`.
 - **Bulk Restore**: Restore emails in bulk back to their original IMAP accounts.
@@ -398,33 +391,6 @@ Interactive API documentation is available at:
 
 All `/api/v1/*` endpoints require `Authorization: Bearer <token>`.
 
-### Read-only blob integrity audit
-
-The fork adds the admin-only `GET /api/v1/blob-integrity` endpoint. It scans a
-bounded attachment-index page and returns aggregate counts for missing index
-entries, missing segments, invalid record bounds, and (when explicitly
-requested) payload verification. The default mode does not return blob data,
-contact IMAP, or write storage. Use `page_size` up to 1000 and set
-`verify_payload=true` only for a bounded checksum/decompression check. The
-response deliberately omits hashes, names, paths, message content, and account
-identifiers.
-
-### OIDC SSO security boundary
-
-The MaxRink fork exposes OIDC at `/api/auth/oidc/login` and
-`/api/auth/oidc/callback`. Configure the issuer, client credentials, and exact
-HTTPS redirect URI with the `BICHON_OIDC_*` environment variables. The issuer
-discovery document and ID-token issuer, audience, nonce, lifetime, signature,
-and (when applicable) `azp` are verified. The callback uses a short-lived,
-single-use server-side handoff so the WebUI token is not placed in a URL.
-
-OIDC users are provisioned with `BICHON_OIDC_DEFAULT_ROLE_ID`, which defaults
-to the least-privileged Member role. Email matching is deliberately strict:
-the provider must send `email_verified=true`, and Bichon refuses to replace a
-different subject or provider already bound to the local account. Pre-link
-accounts explicitly when an IdP does not provide verified email claims; those
-already-bound subjects can still sign in without a fresh email claim.
-
 ## Import & Export
 
 ### Supported Formats
@@ -689,6 +655,10 @@ location /bichon/ {
 }
 ```
 
+### Can I use an OAuth app that has no client secret?
+
+Yes. Native/desktop apps (public clients) have no secret. Microsoft Entra apps on the "Mobile and desktop applications" platform are the common case. Set **Client type** to **Public/native client** in the OAuth2 configuration and leave the secret out. Bichon then relies on PKCE for the code exchange. The redirect URI must match the app registration exactly, e.g. `http://127.0.0.1:15630/oauth2/callback`.
+
 ### Can Bichon send emails?
 
 No. Bichon is an **archiver**, not an email client. The optional SMTP server **receives** emails only — it cannot send, forward, or reply.
@@ -728,7 +698,7 @@ No. Bichon is an **archiver**, not an email client. The optional SMTP server **r
 - [ ] Account-to-account email merge / migration
 - [ ] MCP Server for LLM-powered email search and analysis
 - [ ] S3-compatible storage backend
-- [x] OIDC SSO (MaxRink fork; SAML is not implemented)
+- [ ] Enterprise SSO (OIDC / SAML)
 
 ## Contributing
 

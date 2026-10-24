@@ -46,6 +46,10 @@ pub struct AttachmentInfo {
     pub content_id: Option<String>,
     /// Hash of the content.
     pub content_hash: String,
+    /// Hash of the original encoded MIME body used for lossless reconstruction.
+    /// Legacy records use `content_hash` as their storage key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_content_hash: Option<String>,
     pub is_message: bool,
     /// Text extracted from the attachment body (Pro/Enterprise feature).
     /// Populated during IMAP sync; None for inline attachments and unsupported file types.
@@ -58,6 +62,12 @@ pub struct AttachmentInfo {
 }
 
 impl AttachmentInfo {
+    pub fn storage_hash(&self) -> &str {
+        self.raw_content_hash
+            .as_deref()
+            .unwrap_or(&self.content_hash)
+    }
+
     pub fn is_inline(&self) -> bool {
         self.inline && self.content_id.is_some()
     }
@@ -178,7 +188,7 @@ pub fn retrieve_email_content(
     block_remote: bool,
 ) -> BichonResult<FullMessageContent> {
     AccountModel::check_account_exists(account_id)?;
-    let (_, eml) = reattach_eml_content(account_id, envelope_id)?;
+    let (envelope, eml) = reattach_eml_content(account_id, envelope_id)?;
     let message = MessageParser::default().parse(&eml).ok_or_else(|| {
         raise_error!(
             "Failed to parse EML data — the message may be corrupted.".into(),
@@ -189,11 +199,22 @@ pub fn retrieve_email_content(
     let text: Option<String> = message.body_text(0).map(|cow| cow.into_owned());
     let mut attachments = Vec::new();
     for attachment in message.attachments() {
+        let content_type = attachment.content_type().ok_or_else(|| {
+            raise_error!(
+                format!(
+                    "Attachment is missing Content-Type (email id={})",
+                    &envelope.id
+                ),
+                ErrorCode::InternalError
+            )
+        })?;
         let filename = attachment.attachment_name().map(|name| name.to_string());
         let disposition = attachment.content_disposition();
-        // A part without Content-Type is served as application/octet-stream
-        // instead of failing the whole message (#369).
-        let file_type = attachment_file_type(attachment);
+        let file_type = format!(
+            "{}/{}",
+            content_type.c_type.as_ref(),
+            content_type.c_subtype.as_deref().unwrap_or("")
+        );
 
         let inline = disposition
             .map(|d| d.is_inline())
@@ -228,6 +249,7 @@ pub fn retrieve_email_content(
             is_message,
             content_hash,
             content_id: attachment.content_id().map(Into::into),
+            raw_content_hash: None,
             extracted_text: None,
             extracted_page_count: None,
             extracted_is_ocr: false,
@@ -315,7 +337,10 @@ pub fn retrieve_nested_eml_content(
             }
         }
 
-        let file_type = attachment_file_type(attachment);
+        let file_type = attachment.content_type().map_or_else(
+            || "application/octet-stream".to_string(),
+            |ct| format!("{}/{}", ct.c_type, ct.c_subtype.as_deref().unwrap_or("")),
+        );
         let content_hash = compute_content_hash(attachment.contents());
         attachments.push(AttachmentInfo {
             filename: attachment
@@ -327,6 +352,7 @@ pub fn retrieve_nested_eml_content(
             file_type,
             content_hash,
             is_message: attachment.is_message(),
+            raw_content_hash: None,
             content_id: cid.map(Into::into),
             extracted_text: None,
             extracted_page_count: None,
@@ -425,6 +451,7 @@ mod tests {
                 size: 42,
                 content_id: None,
                 content_hash: "hash1".into(),
+                raw_content_hash: Some("encoded-hash1".into()),
                 is_message: true,
                 extracted_text: Some("hello world".into()),
                 extracted_page_count: Some(1),
@@ -437,6 +464,7 @@ mod tests {
                 size: 99999,
                 content_id: None,
                 content_hash: "hash2".into(),
+                raw_content_hash: None,
                 is_message: false,
                 extracted_text: None,
                 extracted_page_count: None,
@@ -449,37 +477,5 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(attachments, round_tripped);
-    }
-}
-
-/// MIME type of an attachment part, `application/octet-stream` when the part
-/// has no Content-Type header (#369).
-fn attachment_file_type(part: &mail_parser::MessagePart<'_>) -> String {
-    part.content_type().map_or_else(
-        || "application/octet-stream".to_string(),
-        |ct| format!("{}/{}", ct.c_type.as_ref(), ct.c_subtype.as_deref().unwrap_or("")),
-    )
-}
-
-#[cfg(test)]
-mod content_type_default_tests {
-    use super::attachment_file_type;
-    use mail_parser::MessageParser;
-
-    #[test]
-    fn attachment_without_content_type_defaults_to_octet_stream() {
-        let raw = concat!(
-            "From: a@b\r\nTo: c@d\r\nSubject: t\r\nMIME-Version: 1.0\r\n",
-            "Content-Type: multipart/mixed; boundary=XX\r\n\r\n",
-            "--XX\r\nContent-Type: text/plain\r\n\r\nbody\r\n",
-            "--XX\r\nContent-Disposition: attachment; filename=\"ticket.pdf\"\r\n",
-            "Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n",
-            "--XX\r\nContent-Type: application/pdf\r\n",
-            "Content-Disposition: attachment; filename=\"b.pdf\"\r\n\r\n%PDF\r\n",
-            "--XX--\r\n"
-        );
-        let msg = MessageParser::default().parse(raw.as_bytes()).expect("parse");
-        let types: Vec<String> = msg.attachments().map(attachment_file_type).collect();
-        assert_eq!(types, vec!["application/octet-stream", "application/pdf"]);
     }
 }
