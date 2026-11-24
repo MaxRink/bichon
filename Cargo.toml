@@ -86,7 +86,8 @@ html2text = "0.17.1"
 bytes = "1.12"
 dialoguer = "0.12.0"
 console = "0.16.4"
-mail-send = "0.6"
+# dkim (default) pulls mail-auth -> zip 8.6 (CVE-2026-115905); Bichon only uses mail_builder.
+mail-send = { version = "0.6", default-features = false, features = ["digest-md5", "cram-md5", "builder", "aws_lc_rs", "tls12"] }
 rcgen = "0.14"
 rustls-pemfile = "2.2.0"
 blake3 = "1.8"
