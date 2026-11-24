@@ -13,16 +13,24 @@ the homelab Bichon instance. Upstream closed the third-party OIDC PR
 - Backups of replaced `main` lines: tag `archive/main-pre-<release>-<yyyymmdd>`.
 - Topic branches (`codex/*`, `claude/*`, `forward-port/*`) are history only.
 
-## Fork patches (on top of 2.3.0)
+## Fork patches (on top of 2.4.4, forwarded 2026-11-24)
 
 1. `feat(oidc)`: OpenID Connect SSO (ported from rustmailer/bichon#328), JWKS
-   verification of RS/PS/ES/EdDSA ID tokens, PKCE + nonce
+   verification of RS/PS/ES/EdDSA ID tokens, PKCE + nonce. Since 2.4.x
+   upstream ships its own SSO web UI for the licensed Pro edition only (no
+   OSS backend); the login form keeps upstream's code and adds the fork
+   flags (`oidc_enabled`, auto-redirect, `?local=1`, `?sso_error=`,
+   `redirect_to`) and skips the Pro-only `/api/auth/oidc/status` probe.
 2. `fix(oidc)`: bind the verified admin to the existing local account
 3. `security`: exact OIDC subject required for the native admin link
 4. refuse ambiguous OIDC email linking
 5. + 6. default admin password reminder compatibility with 2.2
 7. style fix
 8. this file
+9. `fix(oidc)`: restore the `email_verified` gate (lost in a 2026-10-16
+   cherry-pick; the bichon-server tests did not compile without it)
+10. `build(deps)`: mail-send without the unused `dkim` feature (drops
+    zip 8.6), zip 9 for exports, web runtime lockfile refresh
 
 ## Upstream sync (forward to a new release)
 
@@ -32,6 +40,8 @@ git tag archive/main-pre-<NEW>-$(date +%Y%m%d) main
 git rebase --onto <NEW> <OLD> main      # e.g. --onto 2.3.0 2.2.0
 cargo test -p bichon-core users::tests::oidc_ --lib
 cargo test -p bichon-core --lib account
+cargo test -p bichon-server --lib          # includes the OIDC email gate
+(cd web && pnpm install --frozen-lockfile && pnpm run build)
 git push --force-with-lease origin main archive/main-pre-<NEW>-<yyyymmdd>
 ```
 
