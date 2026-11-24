@@ -113,11 +113,14 @@ pub async fn oidc_callback(Query(params): Query<OidcCallbackParams>) -> Result<R
 
     let claims = result.claims;
 
-    let email = match claims.email.as_deref() {
-        Some(e) if !e.is_empty() => e,
-        _ => {
+    // The email is used to link existing local accounts, so an unverified
+    // claim would let an IdP user who can change their address take over one.
+    let email = match verified_email(&claims) {
+        Some(e) => e,
+        None => {
+            warn!(subject = %claims.sub, "OIDC login rejected: no email claim with email_verified=true");
             return Ok(redirect_login_error(
-                "OIDC provider did not return an email claim; cannot log in",
+                "OIDC provider did not return a verified email claim; cannot log in",
             ));
         }
     };
@@ -258,6 +261,14 @@ fn sanitize_redirect(input: Option<String>) -> Option<String> {
             None
         }
     })
+}
+
+/// A present email claim without `email_verified=true` is deliberately
+/// insufficient: the value links existing local accounts.
+fn verified_email(claims: &bichon_core::oidc::id_token::IdTokenClaims) -> Option<&str> {
+    (claims.email_verified == Some(true))
+        .then_some(claims.email.as_deref().filter(|email| !email.is_empty()))
+        .flatten()
 }
 
 fn redirect_login_error(message: &str) -> Response {
